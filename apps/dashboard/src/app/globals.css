@@ -9,6 +9,11 @@ body {
   font-family: var(--font-sans);
 }
 
+/* خط أكبر شوية: كل المقاسات في Tailwind بالـ rem فبتكبر كلها مع بعض */
+html {
+  font-size: 112.5%;
+}
+
 /* Leaflet يحتاج اتجاه LTR داخلياً لعرض البلاطات صح */
 .leaflet-container {
   direction: ltr;
