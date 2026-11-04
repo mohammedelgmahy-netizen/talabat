@@ -43,7 +43,7 @@ export default function LiveMapPage() {
       label: `#${o.order_number} • ${o.store} • ${orderStatusLabel[o.status]}`,
     })),
   ];
-  const center: [number, number] = points.length ? [points[0].lat, points[0].lng] : [30.0444, 31.2357];
+  const center: [number, number] = points.length ? [points[0].lat, points[0].lng] : [30.895, 29.59];
 
   return (
     <>

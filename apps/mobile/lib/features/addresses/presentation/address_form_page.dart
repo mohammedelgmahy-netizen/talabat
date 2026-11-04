@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 import 'package:latlong2/latlong.dart';
 
 import '../../../core/providers.dart';
+import '../../../core/service_area.dart';
 import '../../../core/widgets/app_map.dart';
 import '../../../core/widgets/common.dart';
 import '../domain/address.dart';
@@ -31,14 +32,24 @@ class _AddressFormPageState extends ConsumerState<AddressFormPage> {
   late String _label = widget.initial?.label ?? 'home';
   late bool _isDefault = widget.initial?.isDefault ?? false;
   late LatLng _point = widget.initial == null
-      ? const LatLng(30.0444, 31.2357) // القاهرة كنقطة بداية
+      ? ServiceArea.fallback.center // وسط منطقة الشغل كنقطة بداية
       : LatLng(widget.initial!.latitude, widget.initial!.longitude);
   bool _busy = false;
+  bool _gotGps = false;
 
   @override
   void initState() {
     super.initState();
-    if (widget.initial == null) _locateMe();
+    if (widget.initial == null) {
+      ref.read(serviceAreaProvider.future).then((a) {
+        if (!mounted || _gotGps) return;
+        setState(() => _point = a.center);
+        try {
+          _map.move(a.center, 14);
+        } catch (_) {}
+      });
+      _locateMe();
+    }
   }
 
   @override
@@ -53,6 +64,7 @@ class _AddressFormPageState extends ConsumerState<AddressFormPage> {
     await runWithFeedback(context, () async {
       final p = await ref.read(locationServiceProvider).current();
       if (!mounted) return;
+      _gotGps = true;
       setState(() => _point = p);
       _map.move(p, 16);
     });

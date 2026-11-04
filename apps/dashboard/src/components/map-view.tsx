@@ -3,7 +3,7 @@
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import { useEffect } from 'react';
-import { CircleMarker, MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from 'react-leaflet';
+import { Circle, CircleMarker, MapContainer, Marker, Popup, TileLayer, useMap, useMapEvents } from 'react-leaflet';
 
 export interface MapPoint {
   id: string;
@@ -43,6 +43,7 @@ export default function MapView({
   height = 420,
   onPick,
   follow,
+  circle,
 }: {
   center: [number, number];
   zoom?: number;
@@ -50,6 +51,8 @@ export default function MapView({
   height?: number;
   onPick?: (lat: number, lng: number) => void;
   follow?: boolean;
+  /** دايرة منطقة الخدمة: المركز ونص القطر بالكيلو */
+  circle?: { lat: number; lng: number; radiusKm: number };
 }) {
   return (
     <div style={{ height }} className="overflow-hidden rounded-xl border">
@@ -57,6 +60,9 @@ export default function MapView({
         <TileLayer attribution="&copy; OpenStreetMap" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
         <ClickHandler onPick={onPick} />
         {follow && <Recenter lat={center[0]} lng={center[1]} />}
+        {circle && (
+          <Circle center={[circle.lat, circle.lng]} radius={circle.radiusKm * 1000} pathOptions={{ color: '#ea580c', fillColor: '#ea580c', fillOpacity: 0.12 }} />
+        )}
         {points.map((p) =>
           p.emoji ? (
             <Marker key={p.id} position={[p.lat, p.lng]} icon={emojiIcon(p.emoji)}>

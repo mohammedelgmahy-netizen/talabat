@@ -44,6 +44,25 @@ export function RoleShell({ role, nav, children, header }: { role: UserRole; nav
   const homeHref = nav[0].href;
   const atHome = current.href === homeHref;
 
+  // الرجوع زي سنام: التنقل بين التابات مش بيتراكم في السجل،
+  // فزرار الرجوع في الموبايل من أي تاب بيرجع للرئيسية مرة واحدة، والرجوع من الرئيسية يقفل البرنامج
+  const KEY = 'talabat-from-home';
+  const goTo = (href: string) => (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (href === current.href) return;
+    if (href === homeHref) {
+      let fromHome = false;
+      try { fromHome = sessionStorage.getItem(KEY) === '1'; sessionStorage.removeItem(KEY); } catch {}
+      if (fromHome) router.back();
+      else router.replace(href);
+    } else if (atHome) {
+      try { sessionStorage.setItem(KEY, '1'); } catch {}
+      router.push(href);
+    } else {
+      router.replace(href);
+    }
+  };
+
   return (
     <div className="grid min-h-dvh grid-cols-[84px_minmax(0,1fr)] lg:grid-cols-[250px_minmax(0,1fr)]">
       {/* القائمة الجانبية: ظاهرة دايماً. على الموبايل أيقونة واسم صغير تحتها، وعلى الكمبيوتر بالعرض الكامل */}
@@ -62,6 +81,7 @@ export function RoleShell({ role, nav, children, header }: { role: UserRole; nav
               <Link
                 key={item.href}
                 href={item.href}
+                onClick={goTo(item.href)}
                 aria-current={active ? 'page' : undefined}
                 className={cn(
                   'relative flex flex-col items-center gap-1 rounded-xl px-0.5 py-2 text-center text-[11px] font-bold leading-tight',
@@ -95,7 +115,7 @@ export function RoleShell({ role, nav, children, header }: { role: UserRole; nav
           {!atHome && (
             <div className="flex gap-2">
               <button
-                onClick={() => router.back()}
+                onClick={goTo(homeHref)}
                 aria-label="رجوع"
                 className="grid size-9 place-items-center rounded-xl border border-white/20 bg-white/15 text-lg hover:bg-white/25 lg:size-10"
               >
@@ -103,6 +123,7 @@ export function RoleShell({ role, nav, children, header }: { role: UserRole; nav
               </button>
               <Link
                 href={homeHref}
+                onClick={goTo(homeHref)}
                 aria-label="الرئيسية"
                 className="grid size-9 place-items-center rounded-xl border border-white/20 bg-white/15 text-lg hover:bg-white/25 lg:size-10"
               >
