@@ -5,7 +5,7 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { useAuth } from '@/components/auth-provider';
 import { Button, ErrorBox, Field, Input } from '@/components/ui';
 import { useAction } from '@/lib/hooks';
-import { APP_TAG, supabase } from '@/lib/supabase';
+import { APP_TAG, loginId, supabase } from '@/lib/supabase';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -27,7 +27,7 @@ export default function LoginPage() {
     setNotice(null);
     await run(async () => {
       if (mode === 'login') {
-        const { error } = await supabase().auth.signInWithPassword({ email: email.trim(), password });
+        const { error } = await supabase().auth.signInWithPassword({ email: loginId(email), password });
         if (error) throw error;
       } else {
         // التسجيل من اللوحة متاح لأصحاب المتاجر فقط؛ الأدمن يُعيَّن يدوياً من قاعدة البيانات
@@ -63,8 +63,8 @@ export default function LoginPage() {
             </Field>
           </>
         )}
-        <Field label="البريد الإلكتروني">
-          <Input type="email" dir="ltr" required value={email} onChange={(e) => setEmail(e.target.value)} />
+        <Field label={mode === 'login' ? 'الإيميل أو رقم الموبايل' : 'البريد الإلكتروني'}>
+          <Input type={mode === 'login' ? 'text' : 'email'} dir="ltr" required value={email} onChange={(e) => setEmail(e.target.value)} />
         </Field>
         <Field label="كلمة المرور">
           <Input type="password" dir="ltr" required minLength={6} value={password} onChange={(e) => setPassword(e.target.value)} />

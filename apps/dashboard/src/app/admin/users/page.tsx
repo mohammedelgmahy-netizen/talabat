@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { Badge, Button, Card, ErrorBox, Input, PageHeader, Select, Spinner, Table, Td } from '@/components/ui';
 import { fmtDateTime, roleLabel } from '@/lib/format';
 import { must, useAction, useLiveQuery } from '@/lib/hooks';
-import { supabase } from '@/lib/supabase';
+import { APP_TAG, loginId, showId, supabase, tempClient } from '@/lib/supabase';
 import { useAuth } from '@/components/auth-provider';
 
 interface UserRow {
@@ -26,6 +26,8 @@ export default function AdminUsersPage() {
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(0);
   const [adminEmail, setAdminEmail] = useState('');
+  const [adminName, setAdminName] = useState('');
+  const [adminPass, setAdminPass] = useState('');
   const [notice, setNotice] = useState('');
   const action = useAction();
 
@@ -48,8 +50,34 @@ export default function AdminUsersPage() {
     action.run(async () => {
       setNotice('');
       must(await supabase().rpc('admin_set_role_by_email', { p_email: email, p_role: newRole }));
-      setNotice(newRole === 'admin' ? `تمام، ${email} بقى مدير زيك` : `اتشالت صلاحية المدير من ${email}`);
+      setNotice(newRole === 'admin' ? `تمام، ${showId(email)} بقى مدير زيك` : `اتشالت صلاحية المدير من ${showId(email)}`);
+      await reload();
+    });
+
+  // زي خير بلدنا: تكتب الموبايل أو الإيميل وباسورد، فيتعمله حساب ويبقى مدير ويدخل على طول
+  const addAdmin = () =>
+    action.run(async () => {
+      setNotice('');
+      const raw = adminEmail.trim();
+      if (!raw.includes('@') && raw.replace(/\D/g, '').length < 8) throw new Error('اكتب رقم موبايل أو إيميل صحيح');
+      const em = loginId(raw);
+      const phone = raw.includes('@') ? undefined : showId(em);
+      const r = await tempClient().auth.signUp({
+        email: em,
+        password: adminPass,
+        options: { data: { app: APP_TAG, full_name: adminName.trim() || 'مدير', phone, role: 'client' } },
+      });
+      const existed = !!r.error && /already|registered|exists/i.test(r.error.message);
+      if (r.error && !existed) throw r.error;
+      must(await supabase().rpc('admin_set_role_by_email', { p_email: em, p_role: 'admin' }));
+      setNotice(
+        existed
+          ? `${showId(em)} كان عنده حساب قبل كده، وبقى مدير. يدخل بالباسورد بتاعه.`
+          : `اتضاف المدير. يدخل بـ ${showId(em)} والباسورد اللي كتبته.`,
+      );
       setAdminEmail('');
+      setAdminName('');
+      setAdminPass('');
       await reload();
     });
 
@@ -61,17 +89,19 @@ export default function AdminUsersPage() {
       <Card className="mb-5">
         <div className="mb-2 font-bold">➕ إضافة مدير معاك</div>
         <p className="mb-3 text-sm text-gray-600">
-          اكتب إيميل الشخص، وهيبقى مدير زيك ويقدر يتحكم في كل حاجة. لو معندوش حساب، خلّيه يعمل حساب من صفحة الدخول الأول.
+          اكتب اسمه ورقم موبايله (أو إيميله) وباسورد، هيبقى مدير زيك ويدخل بيهم على طول من صفحة الدخول.
         </p>
         <form
-          className="flex flex-wrap gap-3"
+          className="grid gap-3 sm:grid-cols-2"
           onSubmit={(e) => {
             e.preventDefault();
-            if (adminEmail.trim()) setRoleByEmail(adminEmail.trim(), 'admin');
+            addAdmin();
           }}
         >
-          <Input type="email" dir="ltr" required placeholder="name@gmail.com" value={adminEmail} onChange={(e) => setAdminEmail(e.target.value)} className="w-72" />
-          <Button type="submit" disabled={action.busy}>اجعله مدير</Button>
+          <Input placeholder="الاسم" value={adminName} onChange={(e) => setAdminName(e.target.value)} />
+          <Input dir="ltr" required placeholder="رقم الموبايل أو الإيميل" value={adminEmail} onChange={(e) => setAdminEmail(e.target.value)} />
+          <Input dir="ltr" type="text" required minLength={6} placeholder="باسورد (6 حروف أو أكتر)" value={adminPass} onChange={(e) => setAdminPass(e.target.value)} />
+          <Button type="submit" disabled={action.busy}>➕ إضافة مدير</Button>
         </form>
         {notice && <div className="mt-3 rounded-xl bg-emerald-50 p-3 text-sm font-semibold text-emerald-800">{notice}</div>}
       </Card>
@@ -97,7 +127,7 @@ export default function AdminUsersPage() {
                 <Td className="font-semibold">{u.full_name}</Td>
                 <Td>{roleLabel[u.role]}</Td>
                 <Td className="text-gray-600">
-                  <div dir="ltr" className="text-right">{u.email}</div>
+                  <div dir="ltr" className="text-right">{u.email ? showId(u.email) : ''}</div>
                   <div dir="ltr" className="text-right text-xs">{u.phone}</div>
                 </Td>
                 <Td>

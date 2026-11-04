@@ -38,3 +38,21 @@ export function errorMessage(e: unknown): string {
   if (/failed to fetch/i.test(msg)) return 'تعذر الاتصال بالخادم';
   return msg;
 }
+
+/** الدخول بالإيميل أو برقم الموبايل (زي خير بلدنا): الرقم بيتحول لإيميل داخلي */
+export const PHONE_DOMAIN = '@talabat.app';
+export function loginId(v: string): string {
+  const t = v.trim().toLowerCase();
+  if (t.includes('@')) return t;
+  let d = t.replace(/\D/g, '');
+  if (d.startsWith('20') && d.length === 12) d = '0' + d.slice(2);
+  return d + PHONE_DOMAIN;
+}
+export const showId = (e: string) => (e.endsWith(PHONE_DOMAIN) ? e.slice(0, -PHONE_DOMAIN.length) : e);
+
+/** عميل مؤقت يعمل حساب جديد من غير ما يخرّج المدير من حسابه */
+export function tempClient() {
+  return createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_KEY!, {
+    auth: { persistSession: false, autoRefreshToken: false, storageKey: 'talabat-new-member' },
+  });
+}
