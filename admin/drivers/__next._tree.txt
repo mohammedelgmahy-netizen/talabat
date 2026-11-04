@@ -1,5 +1,5 @@
-:HL["/talabat/_next/static/chunks/40k8_og_7-4ae.css","style"]
+:HL["/talabat/_next/static/chunks/0ntjfhe02gmdk.css","style"]
 3:[["children",{"s":"__PAGE__","h":160}]]
 2:[["children",{"s":"drivers","h":96,"c":"$Q3"}]]
 1:[["children",{"s":"admin","h":96,"c":"$Q2"}]]
-0:{"b":"qgngSYGYOJZJGIYW6M46s","t":{"t":{"s":"","h":80,"c":"$Q1"}}}
+0:{"b":"oFrIsG_bYnGAFtyHmlZuj","t":{"t":{"s":"","h":80,"c":"$Q1"}}}
