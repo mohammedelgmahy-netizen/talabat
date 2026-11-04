@@ -21,6 +21,9 @@ export function RoleShell({ role, nav, children, header }: { role: UserRole; nav
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
 
+  // أي انتقال لصفحة تانية يقفل القائمة على الموبايل
+  useEffect(() => setOpen(false), [pathname]);
+
   useEffect(() => {
     if (loading || configError) return;
     if (!session) router.replace('/login');
@@ -38,21 +41,21 @@ export function RoleShell({ role, nav, children, header }: { role: UserRole; nav
   }
 
   return (
-    <div className="min-h-screen lg:flex">
+    <div className="min-h-screen lg:ps-64">
       <aside
         className={cn(
-          'fixed inset-y-0 start-0 z-[900] w-64 transform border-e border-gray-200 bg-white transition lg:static lg:translate-x-0',
-          open ? 'translate-x-0' : 'translate-x-full rtl:translate-x-full ltr:-translate-x-full lg:!translate-x-0',
+          'fixed inset-y-0 start-0 z-[900] flex h-dvh w-64 flex-col border-e border-gray-200 bg-white shadow-xl transition-transform duration-200 lg:shadow-none',
+          open ? 'translate-x-0' : 'translate-x-full lg:translate-x-0',
         )}
       >
-        <div className="flex h-16 items-center gap-2 border-b px-5">
+        <div className="flex h-16 shrink-0 items-center gap-2 border-b px-5">
           <span className="text-2xl">🛵</span>
           <div>
             <div className="font-bold">طلبات</div>
             <div className="text-xs text-gray-500">لوحة {roleLabel[role]}</div>
           </div>
         </div>
-        <nav className="space-y-1 p-3">
+        <nav className="min-h-0 flex-1 space-y-1 overflow-y-auto p-3">
           {nav.map((item) => {
             const active = pathname === item.href || (item.href.split('/').length > 2 && pathname.startsWith(item.href));
             return (
@@ -71,7 +74,7 @@ export function RoleShell({ role, nav, children, header }: { role: UserRole; nav
             );
           })}
         </nav>
-        <div className="absolute inset-x-0 bottom-0 border-t p-4">
+        <div className="shrink-0 border-t p-4">
           <div className="mb-2 truncate text-sm font-semibold">{profile.full_name}</div>
           <div className="mb-3 truncate text-xs text-gray-500">{profile.email}</div>
           <button onClick={() => signOut().then(() => router.replace('/login'))} className="text-sm font-semibold text-rose-600">
@@ -80,7 +83,7 @@ export function RoleShell({ role, nav, children, header }: { role: UserRole; nav
         </div>
       </aside>
       {open && <div className="fixed inset-0 z-[800] bg-black/30 lg:hidden" onClick={() => setOpen(false)} />}
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0">
         <header className="sticky top-0 z-[700] flex h-16 items-center gap-3 border-b border-gray-200 bg-white/90 px-4 backdrop-blur lg:px-8">
           <button className="rounded-lg p-2 hover:bg-gray-100 lg:hidden" onClick={() => setOpen(true)} aria-label="القائمة">
             ☰
