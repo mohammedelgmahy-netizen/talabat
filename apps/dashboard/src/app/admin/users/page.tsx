@@ -70,8 +70,8 @@ export default function AdminUsersPage() {
       must(await supabase().rpc('admin_set_role_by_email', { p_email: em, p_role: 'admin' }));
       setNotice(
         existed
-          ? `${showId(em)} كان عنده حساب قبل كده، وبقى مدير. يدخل بالباسورد بتاعه.`
-          : `اتضاف المدير. يدخل بـ ${showId(em)} والباسورد اللي كتبته.`,
+          ? `${showId(em)} كان عنده حساب قبل كده، وبقى مدير. ابعتله اللينك ده: ${location.origin}${process.env.NEXT_PUBLIC_BASE_PATH || ''}/admin-login/ ويدخل بالباسورد بتاعه.`
+          : `اتضاف المدير. ابعتله اللينك ده: ${location.origin}${process.env.NEXT_PUBLIC_BASE_PATH || ''}/admin-login/ ويدخل بـ ${showId(em)} والباسورد اللي كتبته.`,
       );
       setAdminEmail('');
       setAdminName('');
