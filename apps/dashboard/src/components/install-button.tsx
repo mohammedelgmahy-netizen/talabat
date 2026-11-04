@@ -4,9 +4,12 @@ import { useEffect, useState } from 'react';
 
 type InstallEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<unknown> };
 
-/** زرار "تثبيت البرنامج" العائم زي سنام: بيظهر لوحده لما الموبايل يسمح بالتثبيت */
+const APK = 'https://github.com/mohammedelgmahy-netizen/talabat/releases/download/latest/talabat.apk';
+
+/** زرار "تنزيل البرنامج" العائم زي سنام: ظاهر دايماً، يثبت اللوحة لو الموبايل يسمح، وإلا ينزل برنامج الأندرويد */
 export function InstallButton() {
   const [evt, setEvt] = useState<InstallEvent | null>(null);
+  const [hidden, setHidden] = useState(true);
 
   useEffect(() => {
     if ('serviceWorker' in navigator && location.protocol === 'https:') {
@@ -16,7 +19,9 @@ export function InstallButton() {
       e.preventDefault();
       setEvt(e as InstallEvent);
     };
-    const onInstalled = () => setEvt(null);
+    // لو فاتح من البرنامج المثبت خلاص، مفيش داعي للزرار
+    setHidden(window.matchMedia('(display-mode: standalone)').matches || sessionStorage.getItem('talabat-hide-dl') === '1');
+    const onInstalled = () => setHidden(true);
     window.addEventListener('beforeinstallprompt', onPrompt);
     window.addEventListener('appinstalled', onInstalled);
     return () => {
@@ -25,19 +30,41 @@ export function InstallButton() {
     };
   }, []);
 
-  if (!evt) return null;
+  if (hidden) return null;
+  const cls =
+    'fixed bottom-6 left-3 z-[9999] flex items-center gap-2 rounded-full bg-orange-600 px-5 py-3 text-[15px] font-bold text-white shadow-xl';
   return (
-    <button
-      onClick={async () => {
-        await evt.prompt();
-        try {
-          await evt.userChoice;
-        } catch {}
-        setEvt(null);
-      }}
-      className="fixed bottom-6 left-3 z-[9999] flex items-center gap-2 rounded-full bg-orange-600 px-5 py-3 text-[15px] font-bold text-white shadow-xl"
-    >
-      ⬇ تثبيت البرنامج
-    </button>
+    <div className="fixed bottom-6 left-3 z-[9999] flex items-center gap-1">
+      {evt ? (
+        <button
+          onClick={async () => {
+            await evt.prompt();
+            try {
+              await evt.userChoice;
+            } catch {}
+            setEvt(null);
+          }}
+          className={cls.replace('fixed bottom-6 left-3 z-[9999] ', '')}
+        >
+          ⬇ تنزيل البرنامج
+        </button>
+      ) : (
+        <a href={APK} className={cls.replace('fixed bottom-6 left-3 z-[9999] ', '')}>
+          ⬇ تنزيل البرنامج
+        </a>
+      )}
+      <button
+        aria-label="إخفاء"
+        onClick={() => {
+          try {
+            sessionStorage.setItem('talabat-hide-dl', '1');
+          } catch {}
+          setHidden(true);
+        }}
+        className="flex size-8 items-center justify-center rounded-full bg-white text-sm font-bold text-gray-700 shadow"
+      >
+        ✕
+      </button>
+    </div>
   );
 }
