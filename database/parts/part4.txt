@@ -1,0 +1,630 @@
+-- الجزء 4 من 5
+grant execute on function delivery.place_order(uuid, uuid, jsonb, delivery.payment_method, text)      to authenticated;
+grant execute on function delivery.issue_delivery_otp(uuid)                                          to authenticated;
+grant execute on function delivery.verify_delivery_otp(uuid, text)                                   to authenticated, service_role;
+grant execute on function delivery.report_driver_location(double precision, double precision, numeric, numeric, numeric) to authenticated;
+grant execute on function delivery.purge_old_driver_locations(interval)                              to service_role;
+
+
+-- =====================================================================
+-- 25) التحديثات اللحظية (Supabase Realtime / WebSockets)
+--     تطبيق Flutter والداشبورد يشتركوا في تغييرات هذه الجداول،
+--     والـ RLS بيتطبق تلقائياً على الرسائل اللي توصل لكل مستخدم.
+-- =====================================================================
+do $$
+declare
+  t text;
+begin
+  if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+    foreach t in array array['orders', 'deliveries', 'driver_locations', 'drivers'] loop
+      if not exists (
+        select 1 from pg_publication_tables
+        where pubname = 'supabase_realtime' and schemaname = 'delivery' and tablename = t
+      ) then
+        execute format('alter publication supabase_realtime add table delivery.%I', t);
+      end if;
+    end loop;
+  end if;
+end $$;
+
+-- =====================================================================
+-- نهاية الملف
+-- =====================================================================
+
+-- =====================================================================
+--  002_app_api.sql
+--  طبقة الـ API اللي بيستخدمها تطبيق Flutter ولوحات التحكم (Next.js)
+--  تتشغل بعد delivery_schema.sql مباشرة (SQL Editor في Supabase → Run)
+--
+--  المحتوى:
+--   1) حماية أعمدة الطلبات والشحنات من التعديل المباشر
+--   2) تحديث خوارزمية الإسناد: لا يُعاد إسناد الطلب لسائق رفضه + الإسناد الآلي
+--   3) دوال القراءة اللي بترجع إحداثيات lat/lng بدل صيغة PostGIS الثنائية
+--   4) العناوين، الأجهزة و FCM، المتجر، إلغاء الطلب من العميل
+--   5) إحصائيات لوحات التحكم (أدمن / صاحب متجر / سائق)
+--   6) Storage bucket للصور + Realtime لجداول إضافية
+-- =====================================================================
+
+set search_path = delivery, extensions, public;
+
+-- Supabase بيمنحها افتراضياً؛ مكتوبة للتأكيد لأن بعض الدوال invoker وبتستخدم PostGIS
+grant usage on schema extensions to anon, authenticated, service_role;
+
+
+-- =====================================================================
+-- 1) حماية الأعمدة
+-- =====================================================================
+
+-- صاحب المتجر يغيّر الحالة ووقت التحضير وسبب الإلغاء فقط (مش الأسعار ولا العميل)
+create or replace function delivery.guard_order_columns()
+returns trigger
+language plpgsql
+set search_path = delivery, pg_temp
+as $$
+begin
+  if auth.uid() is not null and pg_trigger_depth() = 1 and not delivery.is_admin() then
+    if new.client_id            is distinct from old.client_id
+       or new.store_id             is distinct from old.store_id
+       or new.subtotal             is distinct from old.subtotal
+       or new.delivery_fee         is distinct from old.delivery_fee
+       or new.service_fee          is distinct from old.service_fee
+       or new.discount_amount      is distinct from old.discount_amount
+       or new.tax_amount           is distinct from old.tax_amount
+       or new.commission_rate      is distinct from old.commission_rate
+       or new.delivery_location    is distinct from old.delivery_location
+       or new.delivery_address_text is distinct from old.delivery_address_text
+       or new.payment_method       is distinct from old.payment_method
+       or new.payment_status       is distinct from old.payment_status then
+      raise exception 'غير مسموح بتعديل بيانات الفاتورة' using errcode = '42501';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_orders_guard on delivery.orders;
+create trigger trg_orders_guard before update on delivery.orders
+  for each row execute function delivery.guard_order_columns();
+
+-- السائق يغيّر حالة الشحنة وسبب الفشل وصورة الإثبات فقط
+create or replace function delivery.guard_delivery_columns()
+returns trigger
+language plpgsql
+set search_path = delivery, pg_temp
+as $$
+begin
+  if auth.uid() is not null and pg_trigger_depth() = 1 and not delivery.is_admin() then
+    if new.order_id             is distinct from old.order_id
+       or new.driver_id            is distinct from old.driver_id
+       or new.driver_earning       is distinct from old.driver_earning
+       or new.pickup_location      is distinct from old.pickup_location
+       or new.dropoff_location     is distinct from old.dropoff_location
+       or new.distance_to_store_m  is distinct from old.distance_to_store_m then
+      raise exception 'غير مسموح بتعديل بيانات الشحنة' using errcode = '42501';
+    end if;
+    -- ملاحظة: التسليم نفسه محمي بالفعل في validate_delivery_status_transition (لازم OTP متحقق منه)
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_deliveries_guard on delivery.deliveries;
+create trigger trg_deliveries_guard before update on delivery.deliveries
+  for each row execute function delivery.guard_delivery_columns();
+
+
+-- =====================================================================
+-- 2) الإسناد: نفس خوارزمية الملف الأول مع إضافتين
+--    أ) pg_trigger_depth() > 0 = استدعاء داخلي موثوق (من trigger) فيُسمح به
+--    ب) لا نعيد الطلب لسائق سبق ورفضه أو فشل في توصيله
+-- =====================================================================
+create or replace function delivery.find_nearest_available_drivers(
+  p_store_id          uuid,
+  p_radius_km         numeric  default 5,
+  p_limit             integer  default 10,
+  p_max_location_age  interval default interval '2 minutes'
+)
+returns table (
+  driver_id          uuid,
+  full_name          text,
+  phone              text,
+  vehicle_type       delivery.vehicle_type,
+  rating             numeric,
+  distance_meters    integer,
+  eta_minutes        integer,
+  heading            numeric,
+  latitude           double precision,
+  longitude          double precision,
+  last_location_at   timestamptz,
+  active_deliveries  integer
+)
+language plpgsql stable security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_store_location geography;
+begin
+  if p_radius_km is null or p_radius_km <= 0 or p_radius_km > 50 then
+    raise exception 'نصف قطر البحث يجب أن يكون بين 0 و 50 كم';
+  end if;
+  if p_limit is null or p_limit < 1 or p_limit > 100 then
+    raise exception 'عدد النتائج يجب أن يكون بين 1 و 100';
+  end if;
+
+  if auth.uid() is not null and pg_trigger_depth() = 0
+     and not (delivery.is_admin() or delivery.owns_store(p_store_id)) then
+    raise exception 'غير مصرح' using errcode = '42501';
+  end if;
+
+  select s.location into v_store_location from delivery.stores s where s.id = p_store_id;
+  if v_store_location is null then
+    raise exception 'المتجر غير موجود: %', p_store_id;
+  end if;
+
+  return query
+  with candidates as (
+    select d.user_id, d.vehicle_type, d.rating, d.current_location, d.current_heading,
+           d.last_location_at, d.max_concurrent_deliveries,
+           st_distance(d.current_location, v_store_location) as dist_m
+    from delivery.drivers d
+    join delivery.profiles p on p.id = d.user_id and p.status = 'active'
+    where d.availability = 'online'
+      and d.is_verified
+      and d.current_location is not null
+      and d.last_location_at >= now() - p_max_location_age
+      and st_dwithin(d.current_location, v_store_location, p_radius_km * 1000)
+    order by d.current_location <-> v_store_location
+    limit p_limit * 3
+  ),
+  with_load as (
+    select c.*,
+           (select count(*)::integer from delivery.deliveries dl
+             where dl.driver_id = c.user_id
+               and dl.status in ('assigned', 'accepted', 'arrived_at_store', 'picked_up', 'on_the_way', 'arrived_at_customer')
+           ) as active_cnt
+    from candidates c
+  )
+  select w.user_id, p.full_name, p.phone, w.vehicle_type, w.rating,
+         round(w.dist_m)::integer,
+         greatest(1, ceil((w.dist_m / 1000.0) / (case w.vehicle_type
+                                                 when 'bicycle'    then 15
+                                                 when 'motorcycle' then 30
+                                                 when 'car'        then 25
+                                                 when 'van'        then 22 end) * 60))::integer,
+         w.current_heading,
+         st_y(w.current_location::geometry),
+         st_x(w.current_location::geometry),
+         w.last_location_at,
+         w.active_cnt
+  from with_load w
+  join delivery.profiles p on p.id = w.user_id
+  where w.active_cnt < w.max_concurrent_deliveries
+  order by w.dist_m asc, w.active_cnt asc, w.rating desc
+  limit p_limit;
+end;
+$$;
+
+create or replace function delivery.assign_nearest_driver(
+  p_order_id  uuid,
+  p_radius_km numeric default null
+)
+returns uuid
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_order       delivery.orders%rowtype;
+  v_store_loc   geography;
+  v_radius      numeric;
+  v_candidate   record;
+  v_locked      uuid;
+  v_delivery_id uuid;
+begin
+  select * into v_order from delivery.orders where id = p_order_id for update;
+  if not found then
+    raise exception 'الطلب غير موجود';
+  end if;
+
+  if auth.uid() is not null and pg_trigger_depth() = 0
+     and not (delivery.is_admin() or delivery.owns_store(v_order.store_id)) then
+    raise exception 'غير مصرح' using errcode = '42501';
+  end if;
+
+  if v_order.status not in ('accepted', 'preparing', 'ready_for_pickup') then
+    raise exception 'لا يمكن إسناد سائق لطلب حالته %', v_order.status;
+  end if;
+
+  if exists (select 1 from delivery.deliveries
+             where order_id = p_order_id and status not in ('cancelled', 'failed')) then
+    raise exception 'الطلب لديه شحنة نشطة بالفعل';
+  end if;
+
+  select s.location into v_store_loc from delivery.stores s where s.id = v_order.store_id;
+  select coalesce(p_radius_km, ps.driver_search_radius_km) into v_radius from delivery.platform_settings ps;
+
+  for v_candidate in
+    select * from delivery.find_nearest_available_drivers(v_order.store_id, v_radius, 20)
+  loop
+    -- تخطي السائق اللي رفض نفس الطلب قبل كده
+    continue when exists (select 1 from delivery.deliveries x
+                           where x.order_id = p_order_id and x.driver_id = v_candidate.driver_id);
+
+    select d.user_id into v_locked
+      from delivery.drivers d
+     where d.user_id = v_candidate.driver_id
+       and d.availability = 'online'
+     for update skip locked;
+
+    if v_locked is not null then
+      insert into delivery.deliveries (
+        order_id, driver_id, status, pickup_location, dropoff_location,
+        distance_to_store_m, driver_earning
+      ) values (
+        p_order_id, v_locked, 'assigned', v_store_loc, v_order.delivery_location,
+        v_candidate.distance_meters, round(v_order.delivery_fee * 0.80, 2)
+      )
+      returning id into v_delivery_id;
+
+      update delivery.drivers d
+         set availability = 'busy'
+       where d.user_id = v_locked
+         and (select count(*) from delivery.deliveries x
+               where x.driver_id = v_locked
+                 and x.status in ('assigned', 'accepted', 'arrived_at_store', 'picked_up', 'on_the_way', 'arrived_at_customer')
+             ) >= d.max_concurrent_deliveries;
+
+      return v_delivery_id;
+    end if;
+  end loop;
+
+  return null;
+end;
+$$;
+
+-- إسناد آلي: أول ما المتجر يقبل الطلب، وكمان لو السائق رفض/ألغى الشحنة
+create or replace function delivery.auto_assign_on_order_accept()
+returns trigger
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+begin
+  begin
+    perform delivery.assign_nearest_driver(new.id);
+  exception when others then
+    raise notice 'auto assign skipped for %: %', new.id, sqlerrm;  -- لا نوقف قبول الطلب لو مفيش سائق
+  end;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_orders_auto_assign on delivery.orders;
+create trigger trg_orders_auto_assign after update of status on delivery.orders
+  for each row when (new.status = 'accepted' and old.status = 'pending')
+  execute function delivery.auto_assign_on_order_accept();
+
+create or replace function delivery.auto_reassign_on_delivery_cancel()
+returns trigger
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+begin
+  if exists (select 1 from delivery.orders o
+             where o.id = new.order_id and o.status in ('accepted', 'preparing', 'ready_for_pickup')) then
+    begin
+      perform delivery.assign_nearest_driver(new.order_id);
+    exception when others then
+      raise notice 'auto reassign skipped for %: %', new.order_id, sqlerrm;
+    end;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_deliveries_auto_reassign on delivery.deliveries;
+create trigger trg_deliveries_auto_reassign after update of status on delivery.deliveries
+  for each row when (new.status = 'cancelled' and old.status in ('assigned', 'accepted', 'arrived_at_store'))
+  execute function delivery.auto_reassign_on_delivery_cancel();
+
+-- الطلبات المقبولة اللي ملهاش سائق: تتجدول كل دقيقة بـ pg_cron
+-- select cron.schedule('retry-assign', '* * * * *', 'select delivery.retry_unassigned_orders()');
+create or replace function delivery.retry_unassigned_orders()
+returns integer
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_order_id uuid;
+  v_assigned integer := 0;
+begin
+  for v_order_id in
+    select o.id from delivery.orders o
+     where o.status in ('accepted', 'preparing', 'ready_for_pickup')
+       and not exists (select 1 from delivery.deliveries d
+                        where d.order_id = o.id and d.status not in ('cancelled', 'failed'))
+     order by o.accepted_at nulls last
+     limit 200
+  loop
+    begin
+      if delivery.assign_nearest_driver(v_order_id) is not null then
+        v_assigned := v_assigned + 1;
+      end if;
+    exception when others then
+      null;
+    end;
+  end loop;
+  return v_assigned;
+end;
+$$;
+
+
+-- =====================================================================
+-- 3) المتاجر القريبة للعميل (مع رسوم التوصيل المتوقعة)
+-- =====================================================================
+create or replace function delivery.nearby_stores(
+  p_latitude   double precision,
+  p_longitude  double precision,
+  p_search     text    default null,
+  p_limit      integer default 50,
+  p_offset     integer default 0
+)
+returns table (
+  id                     uuid,
+  name                   text,
+  slug                   text,
+  description            text,
+  logo_url               text,
+  cover_url              text,
+  address_line           text,
+  latitude               double precision,
+  longitude              double precision,
+  distance_km            numeric,
+  delivery_fee           numeric,
+  avg_prep_time_minutes  smallint,
+  min_order_amount       numeric,
+  rating                 numeric,
+  rating_count           integer,
+  is_open                boolean
+)
+language sql stable security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+  with me as (
+    select st_setsrid(st_makepoint(p_longitude, p_latitude), 4326)::geography as g
+  )
+  select s.id, s.name, s.slug, s.description, s.logo_url, s.cover_url, s.address_line,
+         st_y(s.location::geometry), st_x(s.location::geometry),
+         round((st_distance(s.location, me.g) / 1000.0)::numeric, 2),
+         round(s.delivery_fee_base + s.delivery_fee_per_km * (st_distance(s.location, me.g) / 1000.0)::numeric, 2),
+         s.avg_prep_time_minutes, s.min_order_amount, s.rating, s.rating_count, s.is_open
+  from delivery.stores s, me
+  where s.status = 'active'
+    and st_dwithin(s.location, me.g, s.delivery_radius_km * 1000)
+    and (p_search is null or p_search = '' or s.name ilike '%' || p_search || '%'
+         or exists (select 1 from delivery.products p
+                     where p.store_id = s.id and p.status = 'active' and p.name ilike '%' || p_search || '%'))
+  order by s.is_open desc, s.location <-> me.g
+  limit least(greatest(p_limit, 1), 100) offset greatest(p_offset, 0);
+$$;
+
+
+-- =====================================================================
+-- 4) العناوين
+-- =====================================================================
+create or replace function delivery.my_addresses()
+returns table (
+  id uuid, label text, address_line text, building text, floor text, apartment text,
+  landmark text, latitude double precision, longitude double precision, is_default boolean
+)
+language sql stable security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+  select a.id, a.label, a.address_line, a.building, a.floor, a.apartment, a.landmark,
+         st_y(a.location::geometry), st_x(a.location::geometry), a.is_default
+  from delivery.user_addresses a
+  where a.user_id = auth.uid()
+  order by a.is_default desc, a.created_at desc;
+$$;
+
+create or replace function delivery.save_address(
+  p_id            uuid,
+  p_label         text,
+  p_address_line  text,
+  p_building      text,
+  p_floor         text,
+  p_apartment     text,
+  p_landmark      text,
+  p_latitude      double precision,
+  p_longitude     double precision,
+  p_is_default    boolean default false
+)
+returns uuid
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_id  uuid;
+  v_loc geography := st_setsrid(st_makepoint(p_longitude, p_latitude), 4326)::geography;
+begin
+  if v_uid is null then
+    raise exception 'يجب تسجيل الدخول' using errcode = '42501';
+  end if;
+  if p_latitude not between -90 and 90 or p_longitude not between -180 and 180 then
+    raise exception 'إحداثيات غير صحيحة';
+  end if;
+
+  -- أول عنوان يبقى افتراضي تلقائياً
+  if not exists (select 1 from delivery.user_addresses where user_id = v_uid) then
+    p_is_default := true;
+  end if;
+
+  if p_is_default then
+    update delivery.user_addresses set is_default = false where user_id = v_uid and is_default;
+  end if;
+
+  if p_id is null then
+    insert into delivery.user_addresses (user_id, label, address_line, building, floor, apartment, landmark, location, is_default)
+    values (v_uid, coalesce(nullif(p_label, ''), 'home'), p_address_line, p_building, p_floor, p_apartment, p_landmark, v_loc, p_is_default)
+    returning id into v_id;
+  else
+    update delivery.user_addresses
+       set label = coalesce(nullif(p_label, ''), 'home'), address_line = p_address_line,
+           building = p_building, floor = p_floor, apartment = p_apartment, landmark = p_landmark,
+           location = v_loc, is_default = p_is_default
+     where id = p_id and user_id = v_uid
+    returning id into v_id;
+    if v_id is null then
+      raise exception 'العنوان غير موجود';
+    end if;
+  end if;
+  return v_id;
+end;
+$$;
+
+
+-- =====================================================================
+-- 5) تسجيل الجهاز و FCM Token (يُستدعى بعد تسجيل الدخول وعند تجديد الرمز)
+-- =====================================================================
+create or replace function delivery.register_device(
+  p_device_id    text,
+  p_platform     delivery.device_platform,
+  p_fcm_token    text default null,
+  p_device_model text default null,
+  p_app_version  text default null
+)
+returns uuid
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_uid        uuid := auth.uid();
+  v_session_id uuid;
+begin
+  if v_uid is null then
+    raise exception 'يجب تسجيل الدخول' using errcode = '42501';
+  end if;
+
+  insert into delivery.user_sessions (user_id, device_id, device_model, platform, app_version, last_seen_at, revoked_at)
+  values (v_uid, p_device_id, p_device_model, p_platform, p_app_version, now(), null)
+  on conflict (user_id, device_id) do update
+     set device_model = excluded.device_model, platform = excluded.platform,
+         app_version = excluded.app_version, last_seen_at = now(), revoked_at = null
+  returning id into v_session_id;
+
+  if p_fcm_token is not null and char_length(p_fcm_token) >= 20 then
+    -- نفس الرمز ممكن ينتقل لمستخدم تاني على نفس الجهاز
+    insert into delivery.fcm_tokens (user_id, session_id, token, platform, is_active, last_used_at)
+    values (v_uid, v_session_id, p_fcm_token, p_platform, true, now())
+    on conflict (token) do update
+       set user_id = v_uid, session_id = v_session_id, platform = excluded.platform,
+           is_active = true, last_used_at = now();
+    -- أي رمز قديم لنفس الجلسة يتعطل
+    update delivery.fcm_tokens set is_active = false
+     where session_id = v_session_id and token <> p_fcm_token and is_active;
+  end if;
+
+  return v_session_id;
+end;
+$$;
+
+create or replace function delivery.sign_out_device(p_device_id text)
+returns void
+language plpgsql security definer
+set search_path = delivery, pg_temp
+as $$
+begin
+  update delivery.user_sessions set revoked_at = now()
+   where user_id = auth.uid() and device_id = p_device_id;
+  update delivery.fcm_tokens set is_active = false
+   where user_id = auth.uid()
+     and session_id in (select id from delivery.user_sessions where user_id = auth.uid() and device_id = p_device_id);
+end;
+$$;
+
+
+-- =====================================================================
+-- 6) تفاصيل الطلب الكاملة لأي طرف فيه (عميل / متجر / سائق / أدمن)
+--    ترجع أسماء وأرقام الأطراف (اللي الـ RLS بيخفيها) لمن له حق فقط
+-- =====================================================================
+create or replace function delivery.get_order_details(p_order_id uuid)
+returns jsonb
+language plpgsql stable security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_result jsonb;
+begin
+  if not delivery.can_view_order(p_order_id) then
+    raise exception 'غير مصرح' using errcode = '42501';
+  end if;
+
+  select jsonb_build_object(
+    'id', o.id,
+    'order_number', o.order_number,
+    'status', o.status,
+    'subtotal', o.subtotal,
+    'delivery_fee', o.delivery_fee,
+    'service_fee', o.service_fee,
+    'discount_amount', o.discount_amount,
+    'tax_amount', o.tax_amount,
+    'total_amount', o.total_amount,
+    'commission_amount', o.commission_amount,
+    'store_payout', o.store_payout,
+    'distance_km', o.distance_km,
+    'payment_method', o.payment_method,
+    'payment_status', o.payment_status,
+    'customer_notes', o.customer_notes,
+    'estimated_prep_minutes', o.estimated_prep_minutes,
+    'delivery_address_text', o.delivery_address_text,
+    'delivery_latitude', st_y(o.delivery_location::geometry),
+    'delivery_longitude', st_x(o.delivery_location::geometry),
+    'placed_at', o.placed_at,
+    'accepted_at', o.accepted_at,
+    'ready_at', o.ready_at,
+    'picked_up_at', o.picked_up_at,
+    'delivered_at', o.delivered_at,
+    'cancelled_at', o.cancelled_at,
+    'cancellation_reason', o.cancellation_reason,
+    'client', jsonb_build_object('id', c.id, 'full_name', c.full_name, 'phone', c.phone),
+    'store', jsonb_build_object(
+      'id', s.id, 'name', s.name, 'phone', s.phone, 'logo_url', s.logo_url,
+      'address_line', s.address_line,
+      'latitude', st_y(s.location::geometry), 'longitude', st_x(s.location::geometry)
+    ),
+    'items', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'id', i.id, 'product_id', i.product_id, 'product_name', i.product_name,
+               'unit_price', i.unit_price, 'quantity', i.quantity, 'line_total', i.line_total, 'notes', i.notes)
+             order by i.created_at)
+      from delivery.order_items i where i.order_id = o.id), '[]'::jsonb),
+    'history', coalesce((
+      select jsonb_agg(jsonb_build_object('from', h.from_status, 'to', h.to_status, 'note', h.note, 'at', h.created_at)
+             order by h.created_at)
+      from delivery.order_status_history h where h.order_id = o.id), '[]'::jsonb),
+    'delivery', (
+      select jsonb_build_object(
+               'id', d.id, 'status', d.status, 'driver_id', d.driver_id,
+               'driver_name', dp.full_name, 'driver_phone', dp.phone,
+               'vehicle_type', dr.vehicle_type, 'vehicle_plate', dr.vehicle_plate, 'driver_rating', dr.rating,
+               'driver_latitude', st_y(dr.current_location::geometry),
+               'driver_longitude', st_x(dr.current_location::geometry),
+               'driver_heading', dr.current_heading,
+               'driver_earning', d.driver_earning,
+               'assigned_at', d.assigned_at, 'accepted_at', d.accepted_at,
+               'picked_up_at', d.picked_up_at, 'delivered_at', d.delivered_at)
+      from delivery.deliveries d
+      join delivery.drivers dr on dr.user_id = d.driver_id
+      join delivery.profiles dp on dp.id = d.driver_id
+      where d.order_id = o.id
+      order by (d.status in ('cancelled', 'failed')), d.assigned_at desc
+      limit 1)
+  )
+  into v_result
+  from delivery.orders o
+  join delivery.profiles c on c.id = o.client_id
+  join delivery.stores s on s.id = o.store_id
+  where o.id = p_order_id;
+
+  return v_result;
+end;
+$$;

@@ -1,0 +1,73 @@
+name: Build app and dashboard
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+env:
+  SUPABASE_URL: https://opfbfbragbmfxsgyslam.supabase.co
+  # المفتاح العام (publishable) آمن إنه يكون في الكود، وصلاحياته محكومة بالـ RLS
+  SUPABASE_KEY: sb_publishable_uEc0xuXF4PvRNpKTD2Oqqw_ybzdP9gD
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: >
+          flutter build apk --release
+          --dart-define=SUPABASE_URL=$SUPABASE_URL
+          --dart-define=SUPABASE_KEY=$SUPABASE_KEY
+          --dart-define=DB_SCHEMA=delivery
+      - run: cp build/app/outputs/flutter-apk/app-release.apk talabat.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: آخر نسخة من التطبيق
+          make_latest: true
+          files: apps/mobile/talabat.apk
+
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - run: npm ci
+      - run: npx next build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ env.SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_KEY: ${{ env.SUPABASE_KEY }}
+          NEXT_PUBLIC_SUPABASE_SCHEMA: delivery
+          NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: apps/dashboard/out
+          publish_branch: gh-pages

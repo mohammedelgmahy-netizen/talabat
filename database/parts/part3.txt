@@ -1,0 +1,528 @@
+-- الجزء 3 من 5
+
+
+-- =====================================================================
+-- 19) إسناد الطلب تلقائياً لأقرب سائق (آمن ضد التزامن)
+--     FOR UPDATE SKIP LOCKED يمنع إسناد نفس السائق لطلبين في نفس اللحظة
+-- =====================================================================
+create or replace function delivery.assign_nearest_driver(
+  p_order_id  uuid,
+  p_radius_km numeric default null
+)
+returns uuid  -- رقم الشحنة أو null لو مفيش سائق متاح
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_order       delivery.orders%rowtype;
+  v_store_loc   geography;
+  v_radius      numeric;
+  v_candidate   record;
+  v_locked      uuid;
+  v_delivery_id uuid;
+begin
+  select * into v_order from delivery.orders where id = p_order_id for update;
+  if not found then
+    raise exception 'الطلب غير موجود';
+  end if;
+
+  if auth.uid() is not null and not (delivery.is_admin() or delivery.owns_store(v_order.store_id)) then
+    raise exception 'غير مصرح' using errcode = '42501';
+  end if;
+
+  if v_order.status not in ('accepted', 'preparing', 'ready_for_pickup') then
+    raise exception 'لا يمكن إسناد سائق لطلب حالته %', v_order.status;
+  end if;
+
+  if exists (select 1 from delivery.deliveries
+             where order_id = p_order_id and status not in ('cancelled', 'failed')) then
+    raise exception 'الطلب لديه شحنة نشطة بالفعل';
+  end if;
+
+  select s.location into v_store_loc from delivery.stores s where s.id = v_order.store_id;
+  select coalesce(p_radius_km, ps.driver_search_radius_km) into v_radius from delivery.platform_settings ps;
+
+  for v_candidate in
+    select * from delivery.find_nearest_available_drivers(v_order.store_id, v_radius, 20)
+  loop
+    -- محاولة حجز السائق؛ لو محجوز من عملية أخرى نتخطاه
+    select d.user_id into v_locked
+      from delivery.drivers d
+     where d.user_id = v_candidate.driver_id
+       and d.availability = 'online'
+     for update skip locked;
+
+    if v_locked is not null then
+      insert into delivery.deliveries (
+        order_id, driver_id, status, pickup_location, dropoff_location,
+        distance_to_store_m, driver_earning
+      ) values (
+        p_order_id, v_locked, 'assigned', v_store_loc, v_order.delivery_location,
+        v_candidate.distance_meters, round(v_order.delivery_fee * 0.80, 2)  -- 80% من رسوم التوصيل للسائق
+      )
+      returning id into v_delivery_id;
+
+      -- لو وصل السائق للحد الأقصى يتحول لـ busy
+      update delivery.drivers d
+         set availability = 'busy'
+       where d.user_id = v_locked
+         and (select count(*) from delivery.deliveries x
+               where x.driver_id = v_locked
+                 and x.status in ('assigned', 'accepted', 'arrived_at_store', 'picked_up', 'on_the_way', 'arrived_at_customer')
+             ) >= d.max_concurrent_deliveries;
+
+      return v_delivery_id;
+    end if;
+  end loop;
+
+  return null;
+end;
+$$;
+
+
+-- =====================================================================
+-- 20) إنشاء الطلب من جهة السيرفر (يمنع التلاعب بالأسعار من التطبيق)
+--     p_items مثال: '[{"product_id":"...","quantity":2,"notes":"بدون بصل"}]'
+-- =====================================================================
+create or replace function delivery.place_order(
+  p_store_id        uuid,
+  p_address_id      uuid,
+  p_items           jsonb,
+  p_payment_method  delivery.payment_method default 'cash',
+  p_notes           text default null
+)
+returns uuid
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_uid          uuid := auth.uid();
+  v_store        delivery.stores%rowtype;
+  v_address      delivery.user_addresses%rowtype;
+  v_settings     delivery.platform_settings%rowtype;
+  v_distance_km  numeric;
+  v_subtotal     numeric(10,2) := 0;
+  v_delivery_fee numeric(10,2);
+  v_order_id     uuid;
+  v_item         jsonb;
+  v_product      delivery.products%rowtype;
+  v_qty          integer;
+  v_price        numeric(10,2);
+  v_count        integer;
+begin
+  if v_uid is null then
+    raise exception 'يجب تسجيل الدخول' using errcode = '42501';
+  end if;
+  if delivery.current_user_role() <> 'client' then
+    raise exception 'فقط العملاء يمكنهم إنشاء طلبات' using errcode = '42501';
+  end if;
+  if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+    raise exception 'سلة الطلب فارغة';
+  end if;
+  if jsonb_array_length(p_items) > 50 then
+    raise exception 'عدد الأصناف أكبر من المسموح';
+  end if;
+
+  select * into v_store from delivery.stores where id = p_store_id;
+  if not found or v_store.status <> 'active' or not v_store.is_open then
+    raise exception 'المتجر غير متاح حالياً';
+  end if;
+
+  select * into v_address from delivery.user_addresses where id = p_address_id and user_id = v_uid;
+  if not found then
+    raise exception 'العنوان غير موجود';
+  end if;
+
+  v_distance_km := round((st_distance(v_store.location, v_address.location) / 1000.0)::numeric, 2);
+  if v_distance_km > v_store.delivery_radius_km then
+    raise exception 'العنوان خارج نطاق توصيل المتجر (% كم)', v_store.delivery_radius_km;
+  end if;
+
+  select * into v_settings from delivery.platform_settings where id;
+
+  -- التحقق من المنتجات وحساب الإجمالي من الأسعار المخزنة
+  for v_item in select * from jsonb_array_elements(p_items) loop
+    v_qty := (v_item ->> 'quantity')::integer;
+    if v_qty is null or v_qty < 1 or v_qty > 99 then
+      raise exception 'كمية غير صحيحة';
+    end if;
+
+    select * into v_product
+      from delivery.products
+     where id = (v_item ->> 'product_id')::uuid
+       and store_id = p_store_id
+       and status = 'active';
+    if not found then
+      raise exception 'منتج غير متاح: %', v_item ->> 'product_id';
+    end if;
+
+    v_subtotal := v_subtotal + coalesce(v_product.discounted_price, v_product.price) * v_qty;
+  end loop;
+
+  if v_subtotal < v_store.min_order_amount then
+    raise exception 'الحد الأدنى للطلب هو %', v_store.min_order_amount;
+  end if;
+
+  v_delivery_fee := round(v_store.delivery_fee_base + v_store.delivery_fee_per_km * v_distance_km, 2);
+
+  insert into delivery.orders (
+    client_id, store_id, delivery_address_id, delivery_address_text, delivery_location,
+    subtotal, delivery_fee, service_fee, tax_amount, commission_rate, distance_km,
+    payment_method, customer_notes, estimated_prep_minutes
+  ) values (
+    v_uid, p_store_id, v_address.id,
+    concat_ws('، ', v_address.address_line, 'عمارة ' || v_address.building,
+              'دور ' || v_address.floor, 'شقة ' || v_address.apartment, v_address.landmark),
+    v_address.location,
+    v_subtotal, v_delivery_fee, v_settings.service_fee,
+    round(v_subtotal * v_settings.tax_rate / 100, 2),
+    v_store.commission_rate, v_distance_km,
+    p_payment_method, p_notes, v_store.avg_prep_time_minutes
+  )
+  returning id into v_order_id;
+
+  insert into delivery.order_items (order_id, product_id, product_name, unit_price, quantity, notes)
+  select v_order_id, pr.id, pr.name, coalesce(pr.discounted_price, pr.price),
+         (i ->> 'quantity')::integer, nullif(i ->> 'notes', '')
+  from jsonb_array_elements(p_items) i
+  join delivery.products pr on pr.id = (i ->> 'product_id')::uuid;
+
+  get diagnostics v_count = row_count;
+  if v_count <> jsonb_array_length(p_items) then
+    raise exception 'خطأ في أصناف الطلب';
+  end if;
+
+  return v_order_id;
+end;
+$$;
+
+
+-- =====================================================================
+-- 21) رمز التسليم OTP
+-- =====================================================================
+
+-- يستدعيها العميل لعرض الرمز في التطبيق (كل استدعاء يلغي الرمز السابق)
+create or replace function delivery.issue_delivery_otp(p_delivery_id uuid)
+returns text
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_client_id uuid;
+  v_status    delivery.delivery_status;
+  v_settings  delivery.platform_settings%rowtype;
+  v_code      text;
+begin
+  select o.client_id, d.status into v_client_id, v_status
+    from delivery.deliveries d
+    join delivery.orders o on o.id = d.order_id
+   where d.id = p_delivery_id;
+
+  if not found then
+    raise exception 'الشحنة غير موجودة';
+  end if;
+  if auth.uid() is distinct from v_client_id then
+    raise exception 'الرمز متاح لصاحب الطلب فقط' using errcode = '42501';
+  end if;
+  if v_status in ('delivered', 'failed', 'cancelled') then
+    raise exception 'الشحنة منتهية';
+  end if;
+
+  -- منع توليد الرموز بشكل متكرر جداً (مرة كل 30 ثانية)
+  if exists (select 1 from delivery.delivery_otps
+             where delivery_id = p_delivery_id and created_at > now() - interval '30 seconds') then
+    raise exception 'انتظر قليلاً قبل طلب رمز جديد';
+  end if;
+
+  select * into v_settings from delivery.platform_settings where id;
+
+  update delivery.delivery_otps
+     set invalidated_at = now()
+   where delivery_id = p_delivery_id and verified_at is null and invalidated_at is null;
+
+  -- رمز من 4 أرقام عشوائي بشكل آمن (gen_random_bytes)
+  v_code := lpad(((('x' || encode(gen_random_bytes(4), 'hex'))::bit(32)::bigint % 10000))::text, 4, '0');
+
+  insert into delivery.delivery_otps (delivery_id, code_hash, max_attempts, expires_at)
+  values (p_delivery_id, crypt(v_code, gen_salt('bf', 8)), v_settings.otp_max_attempts,
+          now() + make_interval(mins => v_settings.otp_ttl_minutes));
+
+  return v_code;
+end;
+$$;
+
+-- يستدعيها السائق عند التسليم. ترجع JSON بالنتيجة بدلاً من رمي خطأ
+-- حتى يتم حفظ عدد المحاولات الفاشلة (الخطأ يلغي التعديلات).
+create or replace function delivery.verify_delivery_otp(p_delivery_id uuid, p_code text)
+returns jsonb
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_delivery delivery.deliveries%rowtype;
+  v_otp      delivery.delivery_otps%rowtype;
+begin
+  select * into v_delivery from delivery.deliveries where id = p_delivery_id for update;
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'delivery_not_found');
+  end if;
+  if auth.uid() is not null and auth.uid() <> v_delivery.driver_id then
+    return jsonb_build_object('success', false, 'error', 'not_assigned_driver');
+  end if;
+  if v_delivery.status not in ('picked_up', 'on_the_way', 'arrived_at_customer') then
+    return jsonb_build_object('success', false, 'error', 'invalid_delivery_status');
+  end if;
+  if p_code is null or p_code !~ '^[0-9]{4}$' then
+    return jsonb_build_object('success', false, 'error', 'invalid_code_format');
+  end if;
+
+  select * into v_otp
+    from delivery.delivery_otps
+   where delivery_id = p_delivery_id and verified_at is null and invalidated_at is null
+   for update;
+
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'no_active_otp');
+  end if;
+  if v_otp.expires_at < now() then
+    update delivery.delivery_otps set invalidated_at = now() where id = v_otp.id;
+    return jsonb_build_object('success', false, 'error', 'otp_expired');
+  end if;
+  if v_otp.attempts >= v_otp.max_attempts then
+    update delivery.delivery_otps set invalidated_at = now() where id = v_otp.id;
+    return jsonb_build_object('success', false, 'error', 'too_many_attempts');
+  end if;
+
+  if v_otp.code_hash = crypt(p_code, v_otp.code_hash) then
+    update delivery.delivery_otps set verified_at = now(), attempts = attempts + 1 where id = v_otp.id;
+    -- الـ trigger هيحدث الطلب لـ delivered تلقائياً
+    update delivery.deliveries set status = 'delivered' where id = p_delivery_id;
+    return jsonb_build_object('success', true);
+  end if;
+
+  update delivery.delivery_otps
+     set attempts = attempts + 1,
+         invalidated_at = case when attempts + 1 >= max_attempts then now() end
+   where id = v_otp.id;
+
+  return jsonb_build_object(
+    'success', false,
+    'error', 'wrong_code',
+    'remaining_attempts', greatest(v_otp.max_attempts - v_otp.attempts - 1, 0)
+  );
+end;
+$$;
+
+
+-- =====================================================================
+-- 22) تسجيل موقع السائق (يستدعيها تطبيق السائق كل 3-5 ثواني)
+-- =====================================================================
+create or replace function delivery.report_driver_location(
+  p_latitude    double precision,
+  p_longitude   double precision,
+  p_heading     numeric default null,
+  p_speed_kmh   numeric default null,
+  p_accuracy_m  numeric default null
+)
+returns void
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_uid         uuid := auth.uid();
+  v_delivery_id uuid;
+begin
+  if v_uid is null or not exists (select 1 from delivery.drivers where user_id = v_uid) then
+    raise exception 'هذه الخدمة للسائقين فقط' using errcode = '42501';
+  end if;
+
+  select id into v_delivery_id
+    from delivery.deliveries
+   where driver_id = v_uid
+     and status in ('accepted', 'arrived_at_store', 'picked_up', 'on_the_way', 'arrived_at_customer')
+   order by assigned_at desc
+   limit 1;
+
+  insert into delivery.driver_locations (driver_id, delivery_id, latitude, longitude, heading, speed_kmh, accuracy_m)
+  values (v_uid, v_delivery_id, p_latitude, p_longitude,
+          case when p_heading is null then null else mod(p_heading, 360) end,
+          p_speed_kmh, p_accuracy_m);
+end;
+$$;
+
+-- تنظيف سجل المواقع القديم (يُجدول عبر pg_cron يومياً)
+create or replace function delivery.purge_old_driver_locations(p_keep interval default interval '7 days')
+returns bigint
+language plpgsql security definer
+set search_path = delivery, pg_temp
+as $$
+declare
+  v_deleted bigint;
+begin
+  delete from delivery.driver_locations where recorded_at < now() - p_keep;
+  get diagnostics v_deleted = row_count;
+  return v_deleted;
+end;
+$$;
+
+
+-- =====================================================================
+-- 23) سياسات الأمان (Row Level Security)
+-- =====================================================================
+alter table delivery.profiles             enable row level security;
+alter table delivery.user_sessions        enable row level security;
+alter table delivery.fcm_tokens           enable row level security;
+alter table delivery.user_addresses       enable row level security;
+alter table delivery.drivers              enable row level security;
+alter table delivery.stores               enable row level security;
+alter table delivery.store_working_hours  enable row level security;
+alter table delivery.categories           enable row level security;
+alter table delivery.products             enable row level security;
+alter table delivery.platform_settings    enable row level security;
+alter table delivery.orders               enable row level security;
+alter table delivery.order_items          enable row level security;
+alter table delivery.order_status_history enable row level security;
+alter table delivery.deliveries           enable row level security;
+alter table delivery.delivery_otps        enable row level security;  -- بدون أي سياسة = لا وصول إلا عبر الدوال
+alter table delivery.driver_locations     enable row level security;
+
+-- profiles
+drop policy if exists profiles_select on delivery.profiles;
+create policy profiles_select on delivery.profiles for select to authenticated
+  using (id = auth.uid() or delivery.is_admin());
+drop policy if exists profiles_update on delivery.profiles;
+create policy profiles_update on delivery.profiles for update to authenticated
+  using (id = auth.uid() or delivery.is_admin())
+  with check (id = auth.uid() or delivery.is_admin());
+
+-- user_sessions / fcm_tokens / user_addresses: المستخدم يدير بياناته فقط
+drop policy if exists user_sessions_own on delivery.user_sessions;
+create policy user_sessions_own on delivery.user_sessions for all to authenticated
+  using (user_id = auth.uid() or delivery.is_admin())
+  with check (user_id = auth.uid() or delivery.is_admin());
+
+drop policy if exists fcm_tokens_own on delivery.fcm_tokens;
+create policy fcm_tokens_own on delivery.fcm_tokens for all to authenticated
+  using (user_id = auth.uid() or delivery.is_admin())
+  with check (user_id = auth.uid() or delivery.is_admin());
+
+drop policy if exists user_addresses_own on delivery.user_addresses;
+create policy user_addresses_own on delivery.user_addresses for all to authenticated
+  using (user_id = auth.uid() or delivery.is_admin())
+  with check (user_id = auth.uid() or delivery.is_admin());
+
+-- drivers
+drop policy if exists drivers_select on delivery.drivers;
+create policy drivers_select on delivery.drivers for select to authenticated
+  using (user_id = auth.uid() or delivery.is_admin() or delivery.can_track_driver(user_id));
+drop policy if exists drivers_update on delivery.drivers;
+create policy drivers_update on delivery.drivers for update to authenticated
+  using (user_id = auth.uid() or delivery.is_admin())
+  with check (user_id = auth.uid() or delivery.is_admin());
+
+-- stores: الكل يرى المتاجر النشطة، وصاحب المتجر يدير متجره
+drop policy if exists stores_select on delivery.stores;
+create policy stores_select on delivery.stores for select to anon, authenticated
+  using (status = 'active' or owner_id = auth.uid() or delivery.is_admin());
+drop policy if exists stores_insert on delivery.stores;
+create policy stores_insert on delivery.stores for insert to authenticated
+  with check ((owner_id = auth.uid() and delivery.current_user_role() = 'store_owner') or delivery.is_admin());
+drop policy if exists stores_update on delivery.stores;
+create policy stores_update on delivery.stores for update to authenticated
+  using (owner_id = auth.uid() or delivery.is_admin())
+  with check (owner_id = auth.uid() or delivery.is_admin());
+drop policy if exists stores_delete on delivery.stores;
+create policy stores_delete on delivery.stores for delete to authenticated
+  using (delivery.is_admin());
+
+-- store_working_hours / categories / products
+drop policy if exists store_hours_select on delivery.store_working_hours;
+create policy store_hours_select on delivery.store_working_hours for select to anon, authenticated
+  using (true);
+drop policy if exists store_hours_manage on delivery.store_working_hours;
+create policy store_hours_manage on delivery.store_working_hours for all to authenticated
+  using (delivery.owns_store(store_id) or delivery.is_admin())
+  with check (delivery.owns_store(store_id) or delivery.is_admin());
+
+drop policy if exists categories_select on delivery.categories;
+create policy categories_select on delivery.categories for select to anon, authenticated
+  using (is_active or delivery.owns_store(store_id) or delivery.is_admin());
+drop policy if exists categories_manage on delivery.categories;
+create policy categories_manage on delivery.categories for all to authenticated
+  using (delivery.owns_store(store_id) or delivery.is_admin())
+  with check (delivery.owns_store(store_id) or delivery.is_admin());
+
+drop policy if exists products_select on delivery.products;
+create policy products_select on delivery.products for select to anon, authenticated
+  using (status in ('active', 'out_of_stock') or delivery.owns_store(store_id) or delivery.is_admin());
+drop policy if exists products_manage on delivery.products;
+create policy products_manage on delivery.products for all to authenticated
+  using (delivery.owns_store(store_id) or delivery.is_admin())
+  with check (delivery.owns_store(store_id) or delivery.is_admin());
+
+-- platform_settings: قراءة للجميع وتعديل للأدمن
+drop policy if exists platform_settings_select on delivery.platform_settings;
+create policy platform_settings_select on delivery.platform_settings for select to anon, authenticated
+  using (true);
+drop policy if exists platform_settings_update on delivery.platform_settings;
+create policy platform_settings_update on delivery.platform_settings for update to authenticated
+  using (delivery.is_admin()) with check (delivery.is_admin());
+
+-- orders: الإنشاء فقط عبر place_order، والتعديل لصاحب المتجر (قبول/تحضير) أو الأدمن
+drop policy if exists orders_select on delivery.orders;
+create policy orders_select on delivery.orders for select to authenticated
+  using (delivery.can_view_order(id));
+drop policy if exists orders_update on delivery.orders;
+create policy orders_update on delivery.orders for update to authenticated
+  using (delivery.owns_store(store_id) or delivery.is_admin())
+  with check (delivery.owns_store(store_id) or delivery.is_admin());
+
+drop policy if exists order_items_select on delivery.order_items;
+create policy order_items_select on delivery.order_items for select to authenticated
+  using (delivery.can_view_order(order_id));
+
+drop policy if exists order_status_history_select on delivery.order_status_history;
+create policy order_status_history_select on delivery.order_status_history for select to authenticated
+  using (delivery.can_view_order(order_id));
+
+-- deliveries
+drop policy if exists deliveries_select on delivery.deliveries;
+create policy deliveries_select on delivery.deliveries for select to authenticated
+  using (driver_id = auth.uid() or delivery.can_view_order(order_id));
+drop policy if exists deliveries_update_driver on delivery.deliveries;
+create policy deliveries_update_driver on delivery.deliveries for update to authenticated
+  using (driver_id = auth.uid() or delivery.is_admin())
+  with check (driver_id = auth.uid() or delivery.is_admin());
+
+-- driver_locations
+drop policy if exists driver_locations_select on delivery.driver_locations;
+create policy driver_locations_select on delivery.driver_locations for select to authenticated
+  using (driver_id = auth.uid() or delivery.is_admin() or delivery.can_track_driver(driver_id));
+drop policy if exists driver_locations_insert on delivery.driver_locations;
+create policy driver_locations_insert on delivery.driver_locations for insert to authenticated
+  with check (driver_id = auth.uid());
+
+
+-- صلاحيات الجداول (Supabase بيمنحها افتراضياً، وبنكتبها هنا للتأكيد)
+-- الـ RLS هي اللي بتحدد فعلياً مين يشوف/يعدل إيه
+grant usage on schema delivery to anon, authenticated, service_role;
+grant select on all tables in schema delivery to anon;
+grant select, insert, update, delete on all tables in schema delivery to authenticated, service_role;
+grant usage, select on all sequences in schema delivery to authenticated, service_role;
+
+
+-- =====================================================================
+-- 24) صلاحيات تنفيذ الدوال (RPC)
+--     نمنع anon من الدوال الحساسة ونسمح بها لـ authenticated فقط
+-- =====================================================================
+revoke execute on function delivery.find_nearest_available_drivers(uuid, numeric, integer, interval) from public, anon;
+revoke execute on function delivery.assign_nearest_driver(uuid, numeric)                             from public, anon;
+revoke execute on function delivery.place_order(uuid, uuid, jsonb, delivery.payment_method, text)      from public, anon;
+revoke execute on function delivery.issue_delivery_otp(uuid)                                          from public, anon;
+revoke execute on function delivery.verify_delivery_otp(uuid, text)                                   from public, anon;
+revoke execute on function delivery.report_driver_location(double precision, double precision, numeric, numeric, numeric) from public, anon;
+revoke execute on function delivery.purge_old_driver_locations(interval)                              from public, anon, authenticated;
+revoke execute on function delivery.handle_new_auth_user()                                            from public, anon, authenticated;
+
+grant execute on function delivery.find_nearest_available_drivers(uuid, numeric, integer, interval) to authenticated, service_role;
+grant execute on function delivery.assign_nearest_driver(uuid, numeric)                             to authenticated, service_role;

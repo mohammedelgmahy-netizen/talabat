@@ -1,0 +1,364 @@
+-- الجزء 5 من 5
+
+-- العميل يلغي طلبه طالما المتجر لم يقبله بعد
+create or replace function delivery.cancel_my_order(p_order_id uuid, p_reason text default null)
+returns void
+language plpgsql security definer
+set search_path = delivery, pg_temp
+as $$
+declare
+  v_order delivery.orders%rowtype;
+begin
+  select * into v_order from delivery.orders where id = p_order_id for update;
+  if not found or v_order.client_id is distinct from auth.uid() then
+    raise exception 'الطلب غير موجود' using errcode = '42501';
+  end if;
+  if v_order.status <> 'pending' then
+    raise exception 'لا يمكن إلغاء الطلب بعد قبوله من المتجر';
+  end if;
+  update delivery.orders
+     set status = 'cancelled', cancellation_reason = coalesce(nullif(p_reason, ''), 'ألغاه العميل')
+   where id = p_order_id;
+end;
+$$;
+
+
+-- =====================================================================
+-- 7) المتجر: إنشاء/تعديل بإحداثيات + قراءة متاجري
+-- =====================================================================
+create or replace function delivery.save_my_store(
+  p_id                    uuid,
+  p_name                  text,
+  p_slug                  text,
+  p_description           text,
+  p_phone                 text,
+  p_logo_url              text,
+  p_cover_url             text,
+  p_address_line          text,
+  p_latitude              double precision,
+  p_longitude             double precision,
+  p_delivery_radius_km    numeric,
+  p_avg_prep_time_minutes smallint,
+  p_min_order_amount      numeric,
+  p_delivery_fee_base     numeric,
+  p_delivery_fee_per_km   numeric
+)
+returns uuid
+language plpgsql security invoker   -- invoker: الـ RLS والـ guard triggers يتطبقوا عادي
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_id  uuid;
+  v_loc geography := st_setsrid(st_makepoint(p_longitude, p_latitude), 4326)::geography;
+begin
+  if p_id is null then
+    insert into delivery.stores (owner_id, name, slug, description, phone, logo_url, cover_url, address_line,
+                               location, delivery_radius_km, avg_prep_time_minutes, min_order_amount,
+                               delivery_fee_base, delivery_fee_per_km)
+    values (auth.uid(), p_name, lower(p_slug), p_description, nullif(p_phone, ''), p_logo_url, p_cover_url, p_address_line,
+            v_loc, p_delivery_radius_km, p_avg_prep_time_minutes, p_min_order_amount,
+            p_delivery_fee_base, p_delivery_fee_per_km)
+    returning id into v_id;
+  else
+    update delivery.stores
+       set name = p_name, slug = lower(p_slug), description = p_description, phone = nullif(p_phone, ''),
+           logo_url = p_logo_url, cover_url = p_cover_url, address_line = p_address_line, location = v_loc,
+           delivery_radius_km = p_delivery_radius_km, avg_prep_time_minutes = p_avg_prep_time_minutes,
+           min_order_amount = p_min_order_amount, delivery_fee_base = p_delivery_fee_base,
+           delivery_fee_per_km = p_delivery_fee_per_km
+     where id = p_id
+    returning id into v_id;
+    if v_id is null then
+      raise exception 'المتجر غير موجود' using errcode = '42501';
+    end if;
+  end if;
+  return v_id;
+end;
+$$;
+
+create or replace function delivery.store_location(p_store_id uuid)
+returns table (latitude double precision, longitude double precision)
+language sql stable
+set search_path = delivery, extensions, public, pg_temp
+as $$
+  select st_y(location::geometry), st_x(location::geometry) from delivery.stores where id = p_store_id;
+$$;
+
+
+-- =====================================================================
+-- 8) إحصائيات لوحات التحكم
+-- =====================================================================
+
+-- إحصائيات متجر واحد في فترة
+create or replace function delivery.store_dashboard_stats(
+  p_store_id uuid,
+  p_from     timestamptz default date_trunc('day', now()) - interval '29 days',
+  p_to       timestamptz default now()
+)
+returns jsonb
+language plpgsql stable security definer
+set search_path = delivery, pg_temp
+as $$
+declare
+  v jsonb;
+begin
+  if not (delivery.is_admin() or delivery.owns_store(p_store_id)) then
+    raise exception 'غير مصرح' using errcode = '42501';
+  end if;
+
+  with o as (
+    select * from delivery.orders where store_id = p_store_id and placed_at between p_from and p_to
+  )
+  select jsonb_build_object(
+    'orders_total',      (select count(*) from o),
+    'orders_delivered',  (select count(*) from o where status = 'delivered'),
+    'orders_cancelled',  (select count(*) from o where status in ('cancelled', 'rejected')),
+    'orders_active',     (select count(*) from delivery.orders
+                           where store_id = p_store_id and status not in ('delivered', 'cancelled', 'rejected')),
+    'gross_sales',       (select coalesce(sum(subtotal), 0) from o where status = 'delivered'),
+    'commission',        (select coalesce(sum(commission_amount), 0) from o where status = 'delivered'),
+    'payout',            (select coalesce(sum(store_payout), 0) from o where status = 'delivered'),
+    'avg_order_value',   (select coalesce(round(avg(subtotal), 2), 0) from o where status = 'delivered'),
+    'avg_prep_minutes',  (select coalesce(round(avg(extract(epoch from (ready_at - accepted_at)) / 60)::numeric, 1), 0)
+                            from o where ready_at is not null and accepted_at is not null),
+    'daily', coalesce((
+      select jsonb_agg(jsonb_build_object('day', d.day, 'orders', d.cnt, 'sales', d.sales) order by d.day)
+      from (select date_trunc('day', placed_at)::date as day, count(*) as cnt,
+                   coalesce(sum(subtotal) filter (where status = 'delivered'), 0) as sales
+              from o group by 1) d), '[]'::jsonb),
+    'top_products', coalesce((
+      select jsonb_agg(t order by t.qty desc)
+      from (select i.product_name as name, sum(i.quantity) as qty, sum(i.line_total) as revenue
+              from delivery.order_items i join o on o.id = i.order_id
+             where o.status = 'delivered'
+             group by i.product_name order by 2 desc limit 10) t), '[]'::jsonb)
+  ) into v;
+  return v;
+end;
+$$;
+
+-- إحصائيات المنصة كاملة (أدمن)
+create or replace function delivery.admin_dashboard_stats(
+  p_from timestamptz default date_trunc('day', now()) - interval '29 days',
+  p_to   timestamptz default now()
+)
+returns jsonb
+language plpgsql stable security definer
+set search_path = delivery, pg_temp
+as $$
+declare
+  v jsonb;
+begin
+  if not delivery.is_admin() then
+    raise exception 'غير مصرح' using errcode = '42501';
+  end if;
+
+  with o as (select * from delivery.orders where placed_at between p_from and p_to)
+  select jsonb_build_object(
+    'orders_total',       (select count(*) from o),
+    'orders_delivered',   (select count(*) from o where status = 'delivered'),
+    'orders_cancelled',   (select count(*) from o where status in ('cancelled', 'rejected')),
+    'orders_active',      (select count(*) from delivery.orders where status not in ('delivered', 'cancelled', 'rejected')),
+    'gmv',                (select coalesce(sum(total_amount), 0) from o where status = 'delivered'),
+    'commission',         (select coalesce(sum(commission_amount), 0) from o where status = 'delivered'),
+    'service_fees',       (select coalesce(sum(service_fee), 0) from o where status = 'delivered'),
+    'avg_delivery_minutes', (select coalesce(round(avg(extract(epoch from (delivered_at - placed_at)) / 60)::numeric, 1), 0)
+                               from o where delivered_at is not null),
+    'clients',            (select count(*) from delivery.profiles where role = 'client'),
+    'drivers_total',      (select count(*) from delivery.drivers),
+    'drivers_online',     (select count(*) from delivery.drivers where availability in ('online', 'busy')),
+    'drivers_unverified', (select count(*) from delivery.drivers where not is_verified),
+    'stores_active',      (select count(*) from delivery.stores where status = 'active'),
+    'stores_pending',     (select count(*) from delivery.stores where status = 'pending_approval'),
+    'daily', coalesce((
+      select jsonb_agg(jsonb_build_object('day', d.day, 'orders', d.cnt, 'gmv', d.gmv, 'commission', d.comm) order by d.day)
+      from (select date_trunc('day', placed_at)::date as day, count(*) as cnt,
+                   coalesce(sum(total_amount) filter (where status = 'delivered'), 0) as gmv,
+                   coalesce(sum(commission_amount) filter (where status = 'delivered'), 0) as comm
+              from o group by 1) d), '[]'::jsonb),
+    'top_stores', coalesce((
+      select jsonb_agg(t order by t.sales desc)
+      from (select s.id, s.name, count(*) as orders, sum(o.subtotal) as sales
+              from o join delivery.stores s on s.id = o.store_id
+             where o.status = 'delivered'
+             group by s.id, s.name order by 4 desc limit 10) t), '[]'::jsonb)
+  ) into v;
+  return v;
+end;
+$$;
+
+-- خريطة حية للأدمن: السائقين المتصلين + الطلبات النشطة
+create or replace function delivery.admin_live_map()
+returns jsonb
+language plpgsql stable security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+begin
+  if not delivery.is_admin() then
+    raise exception 'غير مصرح' using errcode = '42501';
+  end if;
+  return jsonb_build_object(
+    'drivers', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'id', d.user_id, 'name', p.full_name, 'availability', d.availability,
+               'vehicle_type', d.vehicle_type, 'heading', d.current_heading,
+               'latitude', st_y(d.current_location::geometry), 'longitude', st_x(d.current_location::geometry),
+               'last_location_at', d.last_location_at))
+      from delivery.drivers d join delivery.profiles p on p.id = d.user_id
+      where d.availability <> 'offline' and d.current_location is not null), '[]'::jsonb),
+    'orders', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'id', o.id, 'order_number', o.order_number, 'status', o.status, 'store', s.name,
+               'store_latitude', st_y(s.location::geometry), 'store_longitude', st_x(s.location::geometry),
+               'latitude', st_y(o.delivery_location::geometry), 'longitude', st_x(o.delivery_location::geometry)))
+      from delivery.orders o join delivery.stores s on s.id = o.store_id
+      where o.status not in ('delivered', 'cancelled', 'rejected')), '[]'::jsonb)
+  );
+end;
+$$;
+
+-- قائمة المستخدمين للأدمن مع بيانات السائق إن وُجدت
+create or replace function delivery.admin_list_users(
+  p_role   delivery.user_role default null,
+  p_search text default null,
+  p_limit  integer default 50,
+  p_offset integer default 0
+)
+returns table (
+  id uuid, role delivery.user_role, full_name text, phone text, email text, status delivery.account_status,
+  created_at timestamptz, driver_verified boolean, driver_availability delivery.driver_availability,
+  vehicle_type delivery.vehicle_type, total_deliveries integer, total_count bigint
+)
+language plpgsql stable security definer
+set search_path = delivery, pg_temp
+as $$
+begin
+  if not delivery.is_admin() then
+    raise exception 'غير مصرح' using errcode = '42501';
+  end if;
+  return query
+  select p.id, p.role, p.full_name, p.phone, p.email, p.status, p.created_at,
+         d.is_verified, d.availability, d.vehicle_type, d.total_deliveries,
+         count(*) over ()
+  from delivery.profiles p
+  left join delivery.drivers d on d.user_id = p.id
+  where (p_role is null or p.role = p_role)
+    and (p_search is null or p_search = '' or p.full_name ilike '%' || p_search || '%'
+         or p.phone ilike '%' || p_search || '%' or p.email ilike '%' || p_search || '%')
+  order by p.created_at desc
+  limit least(greatest(p_limit, 1), 200) offset greatest(p_offset, 0);
+end;
+$$;
+
+-- ملخص أرباح السائق
+create or replace function delivery.my_driver_summary()
+returns jsonb
+language sql stable security definer
+set search_path = delivery, pg_temp
+as $$
+  select jsonb_build_object(
+    'today_earnings',     coalesce(sum(driver_earning) filter (where status = 'delivered' and delivered_at >= date_trunc('day', now())), 0),
+    'today_deliveries',   count(*) filter (where status = 'delivered' and delivered_at >= date_trunc('day', now())),
+    'week_earnings',      coalesce(sum(driver_earning) filter (where status = 'delivered' and delivered_at >= date_trunc('week', now())), 0),
+    'week_deliveries',    count(*) filter (where status = 'delivered' and delivered_at >= date_trunc('week', now())),
+    'total_earnings',     coalesce(sum(driver_earning) filter (where status = 'delivered'), 0),
+    'total_deliveries',   count(*) filter (where status = 'delivered'),
+    'cash_to_collect',    coalesce((select sum(o.total_amount) from delivery.deliveries d2
+                                     join delivery.orders o on o.id = d2.order_id
+                                    where d2.driver_id = auth.uid() and o.payment_method = 'cash'
+                                      and d2.status in ('picked_up', 'on_the_way', 'arrived_at_customer')), 0)
+  )
+  from delivery.deliveries
+  where driver_id = auth.uid();
+$$;
+
+
+-- =====================================================================
+-- 9) صلاحيات تنفيذ الدوال الجديدة
+-- =====================================================================
+revoke execute on function delivery.guard_order_columns()                 from public, anon, authenticated;
+revoke execute on function delivery.guard_delivery_columns()              from public, anon, authenticated;
+revoke execute on function delivery.auto_assign_on_order_accept()         from public, anon, authenticated;
+revoke execute on function delivery.auto_reassign_on_delivery_cancel()    from public, anon, authenticated;
+revoke execute on function delivery.retry_unassigned_orders()             from public, anon, authenticated;
+grant  execute on function delivery.retry_unassigned_orders()             to service_role;
+
+grant execute on function delivery.nearby_stores(double precision, double precision, text, integer, integer) to anon, authenticated;
+grant execute on function delivery.store_location(uuid) to anon, authenticated;
+
+revoke execute on function delivery.my_addresses()                         from public, anon;
+revoke execute on function delivery.save_address(uuid, text, text, text, text, text, text, double precision, double precision, boolean) from public, anon;
+revoke execute on function delivery.register_device(text, delivery.device_platform, text, text, text) from public, anon;
+revoke execute on function delivery.sign_out_device(text)                  from public, anon;
+revoke execute on function delivery.get_order_details(uuid)                from public, anon;
+revoke execute on function delivery.cancel_my_order(uuid, text)            from public, anon;
+revoke execute on function delivery.save_my_store(uuid, text, text, text, text, text, text, text, double precision, double precision, numeric, smallint, numeric, numeric, numeric) from public, anon;
+revoke execute on function delivery.store_dashboard_stats(uuid, timestamptz, timestamptz) from public, anon;
+revoke execute on function delivery.admin_dashboard_stats(timestamptz, timestamptz)       from public, anon;
+revoke execute on function delivery.admin_live_map()                       from public, anon;
+revoke execute on function delivery.admin_list_users(delivery.user_role, text, integer, integer) from public, anon;
+revoke execute on function delivery.my_driver_summary()                    from public, anon;
+
+grant execute on function delivery.my_addresses()                         to authenticated;
+grant execute on function delivery.save_address(uuid, text, text, text, text, text, text, double precision, double precision, boolean) to authenticated;
+grant execute on function delivery.register_device(text, delivery.device_platform, text, text, text) to authenticated;
+grant execute on function delivery.sign_out_device(text)                  to authenticated;
+grant execute on function delivery.get_order_details(uuid)                to authenticated;
+grant execute on function delivery.cancel_my_order(uuid, text)            to authenticated;
+grant execute on function delivery.save_my_store(uuid, text, text, text, text, text, text, text, double precision, double precision, numeric, smallint, numeric, numeric, numeric) to authenticated;
+grant execute on function delivery.store_dashboard_stats(uuid, timestamptz, timestamptz) to authenticated;
+grant execute on function delivery.admin_dashboard_stats(timestamptz, timestamptz)       to authenticated;
+grant execute on function delivery.admin_live_map()                       to authenticated;
+grant execute on function delivery.admin_list_users(delivery.user_role, text, integer, integer) to authenticated;
+grant execute on function delivery.my_driver_summary()                    to authenticated;
+
+
+-- =====================================================================
+-- 10) Realtime لجداول إضافية + Storage للصور
+-- =====================================================================
+do $$
+declare
+  t text;
+begin
+  if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+    foreach t in array array['order_status_history', 'stores'] loop
+      if not exists (select 1 from pg_publication_tables
+                      where pubname = 'supabase_realtime' and schemaname = 'delivery' and tablename = t) then
+        execute format('alter publication supabase_realtime add table delivery.%I', t);
+      end if;
+    end loop;
+  end if;
+end $$;
+
+-- bucket عام للصور: المسار stores/<store_id>/... لصاحب المتجر، و avatars/<user_id>/... لأي مستخدم
+do $$
+begin
+  if exists (select 1 from pg_namespace where nspname = 'storage') then
+    insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+    values ('talabat-media', 'talabat-media', true, 5242880, array['image/jpeg', 'image/png', 'image/webp'])
+    on conflict (id) do nothing;
+
+    execute $p$drop policy if exists talabat_media_read on storage.objects$p$;
+    execute $p$create policy talabat_media_read on storage.objects for select to anon, authenticated
+      using (bucket_id = 'talabat-media')$p$;
+
+    execute $p$drop policy if exists talabat_media_write on storage.objects$p$;
+    execute $p$create policy talabat_media_write on storage.objects for insert to authenticated
+      with check (bucket_id = 'talabat-media' and (
+        ((storage.foldername(name))[1] = 'stores' and delivery.owns_store(((storage.foldername(name))[2])::uuid))
+        or ((storage.foldername(name))[1] = 'avatars' and (storage.foldername(name))[2] = auth.uid()::text)
+        or delivery.is_admin()))$p$;
+
+    execute $p$drop policy if exists talabat_media_modify on storage.objects$p$;
+    execute $p$create policy talabat_media_modify on storage.objects for update to authenticated
+      using (bucket_id = 'talabat-media' and (owner = auth.uid() or delivery.is_admin()))$p$;
+
+    execute $p$drop policy if exists talabat_media_delete on storage.objects$p$;
+    execute $p$create policy talabat_media_delete on storage.objects for delete to authenticated
+      using (bucket_id = 'talabat-media' and (owner = auth.uid() or delivery.is_admin()))$p$;
+  end if;
+end $$;
+
+-- =====================================================================
+-- نهاية الملف
+-- =====================================================================

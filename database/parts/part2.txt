@@ -1,0 +1,613 @@
+-- الجزء 2 من 5
+create index if not exists drivers_current_location_gix   on delivery.drivers using gist (current_location)
+  where availability = 'online' and is_verified;            -- فهرس جزئي للسائقين المتاحين فقط
+create index if not exists driver_locations_location_gix  on delivery.driver_locations using gist (location);
+create index if not exists user_addresses_location_gix    on delivery.user_addresses using gist (location);
+create index if not exists orders_delivery_location_gix   on delivery.orders using gist (delivery_location);
+
+-- المستخدمون والجلسات
+create index if not exists profiles_role_idx              on delivery.profiles (role);
+create index if not exists user_sessions_user_idx         on delivery.user_sessions (user_id) where revoked_at is null;
+create index if not exists fcm_tokens_user_active_idx     on delivery.fcm_tokens (user_id) where is_active;
+create index if not exists user_addresses_user_idx        on delivery.user_addresses (user_id);
+create unique index if not exists user_addresses_one_default_uk
+  on delivery.user_addresses (user_id) where is_default;     -- عنوان افتراضي واحد لكل عميل
+
+-- المتاجر والمنتجات
+create index if not exists stores_owner_idx               on delivery.stores (owner_id);
+create index if not exists stores_active_open_idx         on delivery.stores (status, is_open);
+create index if not exists stores_name_trgm_idx           on delivery.stores using gin (name extensions.gin_trgm_ops);
+create index if not exists categories_store_sort_idx      on delivery.categories (store_id, sort_order);
+create index if not exists products_store_category_idx    on delivery.products (store_id, category_id, sort_order);
+create index if not exists products_status_idx            on delivery.products (store_id) where status = 'active';
+create index if not exists products_name_trgm_idx         on delivery.products using gin (name extensions.gin_trgm_ops);
+create index if not exists products_category_idx          on delivery.products (category_id);
+
+-- الطلبات
+create index if not exists orders_client_created_idx      on delivery.orders (client_id, created_at desc);
+create index if not exists orders_store_status_idx        on delivery.orders (store_id, status, created_at desc);
+create index if not exists orders_active_status_idx       on delivery.orders (status)
+  where status not in ('delivered', 'cancelled', 'rejected');
+create index if not exists orders_address_idx             on delivery.orders (delivery_address_id);
+create index if not exists orders_cancelled_by_idx        on delivery.orders (cancelled_by);
+create index if not exists order_items_order_idx          on delivery.order_items (order_id);
+create index if not exists order_items_product_idx        on delivery.order_items (product_id);
+create index if not exists order_status_history_order_idx on delivery.order_status_history (order_id, created_at);
+create index if not exists order_status_history_by_idx    on delivery.order_status_history (changed_by);
+
+-- التوصيل والتتبع
+create index if not exists deliveries_driver_status_idx   on delivery.deliveries (driver_id, status);
+create index if not exists deliveries_order_idx           on delivery.deliveries (order_id);
+-- شحنة نشطة واحدة فقط لكل طلب (يسمح بإعادة الإسناد بعد الإلغاء)
+create unique index if not exists deliveries_one_active_per_order_uk
+  on delivery.deliveries (order_id) where status not in ('cancelled', 'failed');
+create index if not exists delivery_otps_delivery_idx     on delivery.delivery_otps (delivery_id, created_at desc);
+-- رمز فعال واحد فقط لكل شحنة
+create unique index if not exists delivery_otps_one_active_uk
+  on delivery.delivery_otps (delivery_id) where verified_at is null and invalidated_at is null;
+create index if not exists driver_locations_driver_time_idx on delivery.driver_locations (driver_id, recorded_at desc);
+create index if not exists driver_locations_delivery_idx  on delivery.driver_locations (delivery_id, recorded_at desc);
+create index if not exists driver_locations_time_brin     on delivery.driver_locations using brin (recorded_at);
+
+
+-- =====================================================================
+-- 11) دوال الصلاحيات المساعدة (تُستخدم داخل سياسات RLS)
+--     security definer لتجنب التكرار اللانهائي في سياسات RLS
+-- =====================================================================
+create or replace function delivery.current_user_role()
+returns delivery.user_role
+language sql stable security definer
+set search_path = delivery, pg_temp
+as $$
+  select p.role from delivery.profiles p where p.id = auth.uid();
+$$;
+
+create or replace function delivery.is_admin()
+returns boolean
+language sql stable security definer
+set search_path = delivery, pg_temp
+as $$
+  select exists (
+    select 1 from delivery.profiles p
+    where p.id = auth.uid() and p.role = 'admin' and p.status = 'active'
+  );
+$$;
+
+create or replace function delivery.owns_store(p_store_id uuid)
+returns boolean
+language sql stable security definer
+set search_path = delivery, pg_temp
+as $$
+  select exists (select 1 from delivery.stores s where s.id = p_store_id and s.owner_id = auth.uid());
+$$;
+
+-- هل المستخدم الحالي طرف في الطلب؟ (العميل، صاحب المتجر، السائق المسند، الأدمن)
+create or replace function delivery.can_view_order(p_order_id uuid)
+returns boolean
+language sql stable security definer
+set search_path = delivery, pg_temp
+as $$
+  select delivery.is_admin()
+      or exists (
+           select 1 from delivery.orders o
+           join delivery.stores s on s.id = o.store_id
+           where o.id = p_order_id
+             and (o.client_id = auth.uid() or s.owner_id = auth.uid())
+         )
+      or exists (
+           select 1 from delivery.deliveries d
+           where d.order_id = p_order_id and d.driver_id = auth.uid()
+             and d.status not in ('cancelled', 'failed')
+         );
+$$;
+
+-- هل يحق للمستخدم الحالي رؤية موقع هذا السائق؟ (عميل لديه شحنة نشطة معه)
+create or replace function delivery.can_track_driver(p_driver_id uuid)
+returns boolean
+language sql stable security definer
+set search_path = delivery, pg_temp
+as $$
+  select exists (
+    select 1 from delivery.deliveries d
+    join delivery.orders o on o.id = d.order_id
+    join delivery.stores s on s.id = o.store_id
+    where d.driver_id = p_driver_id
+      and d.status in ('assigned', 'accepted', 'arrived_at_store', 'picked_up', 'on_the_way', 'arrived_at_customer')
+      and (o.client_id = auth.uid() or s.owner_id = auth.uid())
+  );
+$$;
+
+
+-- =====================================================================
+-- 12) إنشاء الملف الشخصي تلقائياً عند التسجيل في Supabase Auth
+--     الدور يُقرأ من raw_user_meta_data.role (ممنوع اختيار admin من التطبيق)
+-- =====================================================================
+create or replace function delivery.handle_new_auth_user()
+returns trigger
+language plpgsql security definer
+set search_path = delivery, pg_temp
+as $$
+declare
+  v_role delivery.user_role;
+  v_requested text := coalesce(new.raw_user_meta_data ->> 'role', 'client');
+begin
+  v_role := case when v_requested in ('client', 'driver', 'store_owner')
+                 then v_requested::delivery.user_role
+                 else 'client'::delivery.user_role end;
+
+  insert into delivery.profiles (id, role, full_name, phone, email)
+  values (
+    new.id,
+    v_role,
+    coalesce(nullif(trim(new.raw_user_meta_data ->> 'full_name'), ''), 'مستخدم جديد'),
+    nullif(coalesce(new.phone, new.raw_user_meta_data ->> 'phone'), ''),
+    nullif(new.email, '')
+  );
+
+  if v_role = 'driver' then
+    insert into delivery.drivers (user_id) values (new.id);
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created_talabat on auth.users;
+create trigger on_auth_user_created_talabat
+  after insert on auth.users
+  for each row
+  when (new.raw_user_meta_data ->> 'app' = 'talabat')   -- لا يلمس مستخدمي البرامج الأخرى في نفس المشروع
+  execute function delivery.handle_new_auth_user();
+
+
+-- =====================================================================
+-- 13) حماية الحقول الحساسة من التعديل بواسطة غير الأدمن
+-- =====================================================================
+
+-- المستخدم لا يغيّر دوره أو حالة حسابه بنفسه
+create or replace function delivery.guard_profile_columns()
+returns trigger
+language plpgsql
+set search_path = delivery, pg_temp
+as $$
+begin
+  -- pg_trigger_depth() = 1 يعني تعديل مباشر من المستخدم (وليس من دالة داخلية موثوقة)
+  if auth.uid() is not null and pg_trigger_depth() = 1 and not delivery.is_admin() then
+    if new.role is distinct from old.role or new.status is distinct from old.status then
+      raise exception 'غير مسموح بتعديل الدور أو حالة الحساب' using errcode = '42501';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+-- السائق لا يوثّق نفسه ولا يعدّل تقييمه
+create or replace function delivery.guard_driver_columns()
+returns trigger
+language plpgsql
+set search_path = delivery, pg_temp
+as $$
+begin
+  -- pg_trigger_depth() = 1 يعني تعديل مباشر من المستخدم (وليس من دالة داخلية موثوقة)
+  if auth.uid() is not null and pg_trigger_depth() = 1 and not delivery.is_admin() then
+    if new.is_verified      is distinct from old.is_verified
+       or new.rating           is distinct from old.rating
+       or new.total_deliveries is distinct from old.total_deliveries
+       or new.max_concurrent_deliveries is distinct from old.max_concurrent_deliveries then
+      raise exception 'غير مسموح بتعديل بيانات التوثيق أو التقييم' using errcode = '42501';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+-- صاحب المتجر لا يغيّر العمولة أو حالة الموافقة
+create or replace function delivery.guard_store_columns()
+returns trigger
+language plpgsql
+set search_path = delivery, pg_temp
+as $$
+begin
+  -- pg_trigger_depth() = 1 يعني تعديل مباشر من المستخدم (وليس من دالة داخلية موثوقة)
+  if auth.uid() is not null and pg_trigger_depth() = 1 and not delivery.is_admin() then
+    if tg_op = 'INSERT' then
+      new.status := 'pending_approval';
+      new.commission_rate := 15.00;
+      new.rating := 0;
+      new.rating_count := 0;
+    elsif new.commission_rate is distinct from old.commission_rate
+       or new.status is distinct from old.status
+       or new.owner_id is distinct from old.owner_id
+       or new.rating is distinct from old.rating
+       or new.rating_count is distinct from old.rating_count then
+      raise exception 'غير مسموح بتعديل العمولة أو حالة المتجر أو التقييم' using errcode = '42501';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+
+-- =====================================================================
+-- 14) آلة حالات الطلب (Order State Machine)
+--     تمنع القفز بين الحالات بشكل غير منطقي وتسجل التوقيتات والتاريخ
+-- =====================================================================
+create or replace function delivery.validate_order_status_transition()
+returns trigger
+language plpgsql
+set search_path = delivery, pg_temp
+as $$
+declare
+  v_allowed boolean;
+begin
+  if new.status = old.status then
+    return new;
+  end if;
+
+  v_allowed := case old.status
+    when 'pending'          then new.status in ('accepted', 'rejected', 'cancelled')
+    when 'accepted'         then new.status in ('preparing', 'cancelled')
+    when 'preparing'        then new.status in ('ready_for_pickup', 'cancelled')
+    when 'ready_for_pickup' then new.status in ('picked_up', 'cancelled')
+    when 'picked_up'        then new.status in ('on_the_way', 'delivered')
+    when 'on_the_way'       then new.status in ('delivered')
+    else false  -- delivered / rejected / cancelled حالات نهائية
+  end;
+
+  if not v_allowed then
+    raise exception 'انتقال غير مسموح لحالة الطلب من % إلى %', old.status, new.status
+      using errcode = 'P0001';
+  end if;
+
+  -- تسجيل التوقيتات
+  case new.status
+    when 'accepted'         then new.accepted_at  := coalesce(new.accepted_at, now());
+    when 'ready_for_pickup' then new.ready_at     := coalesce(new.ready_at, now());
+    when 'picked_up'        then new.picked_up_at := coalesce(new.picked_up_at, now());
+    when 'delivered'        then
+      new.delivered_at := coalesce(new.delivered_at, now());
+      if new.payment_method = 'cash' then
+        new.payment_status := 'paid';
+      end if;
+    when 'cancelled', 'rejected' then
+      new.cancelled_at := coalesce(new.cancelled_at, now());
+      new.cancelled_by := coalesce(new.cancelled_by, auth.uid());
+    else null;
+  end case;
+
+  return new;
+end;
+$$;
+
+-- بعد تغيير الحالة: تسجيل التاريخ + إلغاء الشحنة النشطة لو الطلب اتلغى
+create or replace function delivery.after_order_status_change()
+returns trigger
+language plpgsql security definer
+set search_path = delivery, pg_temp
+as $$
+begin
+  if tg_op = 'INSERT' then
+    insert into delivery.order_status_history (order_id, from_status, to_status, changed_by)
+    values (new.id, null, new.status, auth.uid());
+    return new;
+  end if;
+
+  if new.status is distinct from old.status then
+    insert into delivery.order_status_history (order_id, from_status, to_status, changed_by, note)
+    values (new.id, old.status, new.status, auth.uid(),
+            case when new.status in ('cancelled', 'rejected') then new.cancellation_reason end);
+
+    if new.status in ('cancelled', 'rejected') then
+      update delivery.deliveries
+         set status = 'cancelled', cancelled_at = now()
+       where order_id = new.id
+         and status not in ('delivered', 'failed', 'cancelled');
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+
+-- =====================================================================
+-- 15) منطق الشحنة: آلة الحالات + الربط بحالة الطلب + منع التسليم بدون OTP
+-- =====================================================================
+create or replace function delivery.validate_delivery_status_transition()
+returns trigger
+language plpgsql
+set search_path = delivery, pg_temp
+as $$
+declare
+  v_allowed boolean;
+begin
+  if new.status = old.status then
+    return new;
+  end if;
+
+  v_allowed := case old.status
+    when 'assigned'            then new.status in ('accepted', 'cancelled')
+    when 'accepted'            then new.status in ('arrived_at_store', 'cancelled')
+    when 'arrived_at_store'    then new.status in ('picked_up', 'cancelled')
+    when 'picked_up'           then new.status in ('on_the_way', 'arrived_at_customer', 'failed')
+    when 'on_the_way'          then new.status in ('arrived_at_customer', 'delivered', 'failed')
+    when 'arrived_at_customer' then new.status in ('delivered', 'failed')
+    else false
+  end;
+
+  if not v_allowed then
+    raise exception 'انتقال غير مسموح لحالة الشحنة من % إلى %', old.status, new.status
+      using errcode = 'P0001';
+  end if;
+
+  -- السائق لا يستلم الطلب إلا بعد ما المتجر يعلنه جاهز
+  if new.status = 'picked_up' and not exists (
+       select 1 from delivery.orders o
+       where o.id = new.order_id and o.status = 'ready_for_pickup'
+     ) then
+    raise exception 'الطلب لم يصبح جاهزاً للاستلام بعد' using errcode = 'P0001';
+  end if;
+
+  -- حماية التسليم: لا يمكن وضع الحالة delivered إلا برمز OTP تم التحقق منه
+  if new.status = 'delivered' and not exists (
+       select 1 from delivery.delivery_otps o
+       where o.delivery_id = new.id and o.verified_at is not null
+     ) then
+    raise exception 'لا يمكن تأكيد التسليم بدون التحقق من رمز OTP' using errcode = '42501';
+  end if;
+
+  case new.status
+    when 'accepted'            then new.accepted_at            := coalesce(new.accepted_at, now());
+    when 'arrived_at_store'    then new.arrived_at_store_at    := coalesce(new.arrived_at_store_at, now());
+    when 'picked_up'           then new.picked_up_at           := coalesce(new.picked_up_at, now());
+    when 'arrived_at_customer' then new.arrived_at_customer_at := coalesce(new.arrived_at_customer_at, now());
+    when 'delivered'           then new.delivered_at           := coalesce(new.delivered_at, now());
+    when 'cancelled'           then new.cancelled_at           := coalesce(new.cancelled_at, now());
+    else null;
+  end case;
+
+  return new;
+end;
+$$;
+
+-- مزامنة حالة الطلب وحالة السائق مع الشحنة
+create or replace function delivery.sync_order_from_delivery()
+returns trigger
+language plpgsql security definer
+set search_path = delivery, pg_temp
+as $$
+declare
+  v_order_status delivery.order_status;
+  v_active_count integer;
+begin
+  if new.status = old.status then
+    return new;
+  end if;
+
+  select status into v_order_status from delivery.orders where id = new.order_id for update;
+
+  if new.status = 'picked_up' and v_order_status = 'ready_for_pickup' then
+    update delivery.orders set status = 'picked_up' where id = new.order_id;
+  elsif new.status in ('on_the_way', 'arrived_at_customer') and v_order_status = 'picked_up' then
+    update delivery.orders set status = 'on_the_way' where id = new.order_id;
+  elsif new.status = 'delivered' and v_order_status in ('picked_up', 'on_the_way') then
+    update delivery.orders set status = 'delivered' where id = new.order_id;
+    update delivery.drivers set total_deliveries = total_deliveries + 1 where user_id = new.driver_id;
+  end if;
+
+  -- تحديث توفر السائق حسب عدد الشحنات النشطة
+  select count(*) into v_active_count
+  from delivery.deliveries
+  where driver_id = new.driver_id
+    and status in ('assigned', 'accepted', 'arrived_at_store', 'picked_up', 'on_the_way', 'arrived_at_customer');
+
+  update delivery.drivers d
+     set availability = case
+           when v_active_count >= d.max_concurrent_deliveries then 'busy'::delivery.driver_availability
+           when d.availability = 'busy' then 'online'::delivery.driver_availability
+           else d.availability end
+   where d.user_id = new.driver_id;
+
+  return new;
+end;
+$$;
+
+
+-- =====================================================================
+-- 16) تحديث آخر موقع للسائق عند كل نقطة تتبع جديدة
+-- =====================================================================
+create or replace function delivery.update_driver_current_location()
+returns trigger
+language plpgsql security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+begin
+  update delivery.drivers
+     set current_location = new.location,
+         current_heading  = new.heading,
+         last_location_at = new.recorded_at
+   where user_id = new.driver_id
+     and (last_location_at is null or last_location_at <= new.recorded_at);
+  return new;
+end;
+$$;
+
+
+-- =====================================================================
+-- 17) ربط الـ Triggers
+-- =====================================================================
+drop trigger if exists trg_profiles_updated_at on delivery.profiles;
+create trigger trg_profiles_updated_at before update on delivery.profiles
+  for each row execute function delivery.set_updated_at();
+
+drop trigger if exists trg_profiles_guard on delivery.profiles;
+create trigger trg_profiles_guard before update on delivery.profiles
+  for each row execute function delivery.guard_profile_columns();
+
+drop trigger if exists trg_fcm_tokens_updated_at on delivery.fcm_tokens;
+create trigger trg_fcm_tokens_updated_at before update on delivery.fcm_tokens
+  for each row execute function delivery.set_updated_at();
+
+drop trigger if exists trg_user_addresses_updated_at on delivery.user_addresses;
+create trigger trg_user_addresses_updated_at before update on delivery.user_addresses
+  for each row execute function delivery.set_updated_at();
+
+drop trigger if exists trg_drivers_updated_at on delivery.drivers;
+create trigger trg_drivers_updated_at before update on delivery.drivers
+  for each row execute function delivery.set_updated_at();
+
+drop trigger if exists trg_drivers_guard on delivery.drivers;
+create trigger trg_drivers_guard before update on delivery.drivers
+  for each row execute function delivery.guard_driver_columns();
+
+drop trigger if exists trg_stores_updated_at on delivery.stores;
+create trigger trg_stores_updated_at before update on delivery.stores
+  for each row execute function delivery.set_updated_at();
+
+drop trigger if exists trg_stores_guard on delivery.stores;
+create trigger trg_stores_guard before insert or update on delivery.stores
+  for each row execute function delivery.guard_store_columns();
+
+drop trigger if exists trg_categories_updated_at on delivery.categories;
+create trigger trg_categories_updated_at before update on delivery.categories
+  for each row execute function delivery.set_updated_at();
+
+drop trigger if exists trg_products_updated_at on delivery.products;
+create trigger trg_products_updated_at before update on delivery.products
+  for each row execute function delivery.set_updated_at();
+
+drop trigger if exists trg_orders_updated_at on delivery.orders;
+create trigger trg_orders_updated_at before update on delivery.orders
+  for each row execute function delivery.set_updated_at();
+
+drop trigger if exists trg_orders_validate_status on delivery.orders;
+create trigger trg_orders_validate_status before update of status on delivery.orders
+  for each row execute function delivery.validate_order_status_transition();
+
+drop trigger if exists trg_orders_after_status on delivery.orders;
+create trigger trg_orders_after_status after insert or update of status on delivery.orders
+  for each row execute function delivery.after_order_status_change();
+
+drop trigger if exists trg_deliveries_updated_at on delivery.deliveries;
+create trigger trg_deliveries_updated_at before update on delivery.deliveries
+  for each row execute function delivery.set_updated_at();
+
+drop trigger if exists trg_deliveries_validate_status on delivery.deliveries;
+create trigger trg_deliveries_validate_status before update of status on delivery.deliveries
+  for each row execute function delivery.validate_delivery_status_transition();
+
+drop trigger if exists trg_deliveries_sync_order on delivery.deliveries;
+create trigger trg_deliveries_sync_order after update of status on delivery.deliveries
+  for each row execute function delivery.sync_order_from_delivery();
+
+drop trigger if exists trg_driver_locations_current on delivery.driver_locations;
+create trigger trg_driver_locations_current after insert on delivery.driver_locations
+  for each row execute function delivery.update_driver_current_location();
+
+
+-- =====================================================================
+-- 18) خوارزمية أقرب السائقين المتاحين (Nearest Available Drivers)
+--
+--  الفكرة:
+--   1. نجيب نقطة المتجر.
+--   2. نفلتر السائقين: online + موثّق + حسابه active + آخر موقع حديث
+--      (أحدث من p_max_location_age) + داخل نصف القطر (ST_DWithin يستخدم فهرس GIST).
+--   3. نرتب بـ KNN (<->) اللي بيستخدم الفهرس الجغرافي مباشرة.
+--   4. نستبعد السائق اللي وصل للحد الأقصى من الشحنات النشطة.
+--   5. نرجع المسافة الفعلية بالمتر والوقت التقريبي للوصول حسب نوع المركبة.
+-- =====================================================================
+create or replace function delivery.find_nearest_available_drivers(
+  p_store_id          uuid,
+  p_radius_km         numeric  default 5,
+  p_limit             integer  default 10,
+  p_max_location_age  interval default interval '2 minutes'
+)
+returns table (
+  driver_id          uuid,
+  full_name          text,
+  phone              text,
+  vehicle_type       delivery.vehicle_type,
+  rating             numeric,
+  distance_meters    integer,
+  eta_minutes        integer,
+  heading            numeric,
+  latitude           double precision,
+  longitude          double precision,
+  last_location_at   timestamptz,
+  active_deliveries  integer
+)
+language plpgsql stable security definer
+set search_path = delivery, extensions, public, pg_temp
+as $$
+declare
+  v_store_location geography;
+begin
+  if p_radius_km is null or p_radius_km <= 0 or p_radius_km > 50 then
+    raise exception 'نصف قطر البحث يجب أن يكون بين 0 و 50 كم';
+  end if;
+  if p_limit is null or p_limit < 1 or p_limit > 100 then
+    raise exception 'عدد النتائج يجب أن يكون بين 1 و 100';
+  end if;
+
+  -- مسموح فقط للأدمن أو صاحب المتجر أو الخدمات الخلفية (service_role)
+  if auth.uid() is not null and not (delivery.is_admin() or delivery.owns_store(p_store_id)) then
+    raise exception 'غير مصرح' using errcode = '42501';
+  end if;
+
+  select s.location into v_store_location from delivery.stores s where s.id = p_store_id;
+  if v_store_location is null then
+    raise exception 'المتجر غير موجود: %', p_store_id;
+  end if;
+
+  return query
+  with candidates as (
+    select d.user_id,
+           d.vehicle_type,
+           d.rating,
+           d.current_location,
+           d.current_heading,
+           d.last_location_at,
+           d.max_concurrent_deliveries,
+           st_distance(d.current_location, v_store_location) as dist_m
+    from delivery.drivers d
+    join delivery.profiles p on p.id = d.user_id and p.status = 'active'
+    where d.availability = 'online'
+      and d.is_verified
+      and d.current_location is not null
+      and d.last_location_at >= now() - p_max_location_age
+      and st_dwithin(d.current_location, v_store_location, p_radius_km * 1000)
+    order by d.current_location <-> v_store_location
+    limit p_limit * 3     -- نجيب عدد أكبر احتياطياً قبل فلترة السائقين المشغولين
+  ),
+  with_load as (
+    select c.*,
+           (select count(*)::integer
+              from delivery.deliveries dl
+             where dl.driver_id = c.user_id
+               and dl.status in ('assigned', 'accepted', 'arrived_at_store', 'picked_up', 'on_the_way', 'arrived_at_customer')
+           ) as active_cnt
+    from candidates c
+  )
+  select w.user_id,
+         p.full_name,
+         p.phone,
+         w.vehicle_type,
+         w.rating,
+         round(w.dist_m)::integer,
+         -- الوقت التقريبي = المسافة / متوسط السرعة حسب المركبة (كم/س)
+         greatest(1, ceil((w.dist_m / 1000.0) / (case w.vehicle_type
+                                                 when 'bicycle'    then 15
+                                                 when 'motorcycle' then 30
+                                                 when 'car'        then 25
+                                                 when 'van'        then 22 end) * 60))::integer,
+         w.current_heading,
+         st_y(w.current_location::geometry),
+         st_x(w.current_location::geometry),
+         w.last_location_at,
+         w.active_cnt
+  from with_load w
+  join delivery.profiles p on p.id = w.user_id
+  where w.active_cnt < w.max_concurrent_deliveries
+  order by w.dist_m asc, w.active_cnt asc, w.rating desc
+  limit p_limit;
+end;
+$$;
