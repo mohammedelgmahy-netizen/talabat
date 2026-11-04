@@ -1,6 +1,6 @@
-:HL["/talabat/_next/static/chunks/2pkrd7884-1ur.css","style"]
+:HL["/talabat/_next/static/chunks/1w-l_oaae1wou.css","style"]
 :HL["https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&display=swap","style"]
 3:[["children",{"s":"__PAGE__","h":160}]]
 2:[["children",{"s":"menu","h":96,"c":"$Q3"}]]
 1:[["children",{"s":"store","h":96,"c":"$Q2"}]]
-0:{"b":"zfEpm7Mos9q4xmDqKx1O9","t":{"t":{"s":"","h":80,"c":"$Q1"}}}
+0:{"b":"-74ZPBC2ANLxxN2l1PoZL","t":{"t":{"s":"","h":80,"c":"$Q1"}}}
