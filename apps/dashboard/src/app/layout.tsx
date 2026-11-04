@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from 'next';
 import { AuthProvider } from '@/components/auth-provider';
+import { InstallButton } from '@/components/install-button';
 import './globals.css';
 
 export const metadata: Metadata = {
@@ -22,6 +23,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
       </head>
       <body className="text-gray-900 antialiased">
         <AuthProvider>{children}</AuthProvider>
+        <InstallButton />
       </body>
     </html>
   );
