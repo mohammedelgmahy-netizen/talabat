@@ -43,11 +43,11 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-orange-50 to-white p-4">
-      <form onSubmit={submit} className="w-full max-w-sm space-y-4 rounded-2xl border bg-white p-8 shadow-sm">
+    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-orange-700 to-orange-500 p-4">
+      <form onSubmit={submit} className="w-full max-w-sm space-y-4 rounded-2xl bg-white p-7 shadow-2xl">
         <div className="text-center">
-          <div className="text-5xl">🛵</div>
-          <h1 className="mt-2 text-2xl font-bold">طلبات</h1>
+          <img src={`${process.env.NEXT_PUBLIC_BASE_PATH || ''}/icon-192.png`} alt="" className="mx-auto size-14 rounded-2xl" />
+          <h1 className="mt-3 text-2xl font-extrabold">طلبات</h1>
           <p className="text-sm text-gray-500">{mode === 'login' ? 'تسجيل الدخول للوحة التحكم' : 'تسجيل متجر جديد'}</p>
         </div>
         {configError && <ErrorBox message={configError} />}

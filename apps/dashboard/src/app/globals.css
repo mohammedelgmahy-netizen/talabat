@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "Segoe UI", Tahoma, "Noto Sans Arabic", system-ui, sans-serif;
+  --font-sans: "Cairo", "Segoe UI", Tahoma, system-ui, sans-serif;
 }
 
 html,
@@ -12,6 +12,11 @@ body {
 /* خط أكبر شوية: كل المقاسات في Tailwind بالـ rem فبتكبر كلها مع بعض */
 html {
   font-size: 112.5%;
+}
+
+body {
+  font-weight: 500;
+  background: #eef2f7;
 }
 
 /* Leaflet يحتاج اتجاه LTR داخلياً لعرض البلاطات صح */
