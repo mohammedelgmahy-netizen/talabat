@@ -25,6 +25,8 @@ export default function AdminUsersPage() {
   const [role, setRole] = useState('');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(0);
+  const [adminEmail, setAdminEmail] = useState('');
+  const [notice, setNotice] = useState('');
   const action = useAction();
 
   const { data, error, loading, reload } = useLiveQuery<UserRow[]>(
@@ -41,11 +43,38 @@ export default function AdminUsersPage() {
       await reload();
     });
 
+  // يدّي أو يشيل صلاحية المدير بالإيميل (بيشتغل حتى لو الحساب متسجل في برنامج تاني على نفس Supabase)
+  const setRoleByEmail = (email: string, newRole: 'admin' | 'client' | 'store_owner') =>
+    action.run(async () => {
+      setNotice('');
+      must(await supabase().rpc('admin_set_role_by_email', { p_email: email, p_role: newRole }));
+      setNotice(newRole === 'admin' ? `تمام، ${email} بقى مدير زيك` : `اتشالت صلاحية المدير من ${email}`);
+      setAdminEmail('');
+      await reload();
+    });
+
   const total = data?.[0]?.total_count ?? 0;
 
   return (
     <>
       <PageHeader title="المستخدمون" subtitle={`${total} مستخدم`} />
+      <Card className="mb-5">
+        <div className="mb-2 font-bold">➕ إضافة مدير معاك</div>
+        <p className="mb-3 text-sm text-gray-600">
+          اكتب إيميل الشخص، وهيبقى مدير زيك ويقدر يتحكم في كل حاجة. لو معندوش حساب، خلّيه يعمل حساب من صفحة الدخول الأول.
+        </p>
+        <form
+          className="flex flex-wrap gap-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (adminEmail.trim()) setRoleByEmail(adminEmail.trim(), 'admin');
+          }}
+        >
+          <Input type="email" dir="ltr" required placeholder="name@gmail.com" value={adminEmail} onChange={(e) => setAdminEmail(e.target.value)} className="w-72" />
+          <Button type="submit" disabled={action.busy}>اجعله مدير</Button>
+        </form>
+        {notice && <div className="mt-3 rounded-xl bg-emerald-50 p-3 text-sm font-semibold text-emerald-800">{notice}</div>}
+      </Card>
       <Card>
         <div className="mb-4 flex flex-wrap gap-3">
           <Select value={role} onChange={(e) => { setRole(e.target.value); setPage(0); }} className="w-44">
@@ -77,7 +106,18 @@ export default function AdminUsersPage() {
                   </Badge>
                 </Td>
                 <Td className="text-gray-500">{fmtDateTime(u.created_at)}</Td>
-                <Td>
+                <Td className="space-x-2 space-x-reverse whitespace-nowrap">
+                  {u.id !== profile?.id && u.email && (
+                    u.role === 'admin' ? (
+                      <Button variant="secondary" className="px-2 py-1 text-xs" disabled={action.busy} onClick={() => setRoleByEmail(u.email!, 'client')}>
+                        شيل المدير
+                      </Button>
+                    ) : (
+                      <Button variant="secondary" className="px-2 py-1 text-xs" disabled={action.busy} onClick={() => setRoleByEmail(u.email!, 'admin')}>
+                        اجعله مدير
+                      </Button>
+                    )
+                  )}
                   {u.id !== profile?.id &&
                     (u.status === 'active' ? (
                       <Button variant="danger" className="px-2 py-1 text-xs" disabled={action.busy} onClick={() => setStatus(u, 'suspended')}>
