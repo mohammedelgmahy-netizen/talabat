@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { Badge, Button, Card, ErrorBox, Input, PageHeader, Select, Spinner, Table, Td } from '@/components/ui';
 import { fmtDateTime, roleLabel } from '@/lib/format';
 import { must, useAction, useLiveQuery } from '@/lib/hooks';
-import { APP_TAG, loginId, showId, supabase, tempClient } from '@/lib/supabase';
+import { APP_TAG, showId, supabase, tempClient } from '@/lib/supabase';
 import { useAuth } from '@/components/auth-provider';
 
 interface UserRow {
@@ -54,18 +54,16 @@ export default function AdminUsersPage() {
       await reload();
     });
 
-  // زي خير بلدنا: تكتب الموبايل أو الإيميل وباسورد، فيتعمله حساب ويبقى مدير ويدخل على طول
+  // زي خير بلدنا: تكتب الإيميل وباسورد، فيتعمله حساب ويبقى مدير ويدخل على طول
   const addAdmin = () =>
     action.run(async () => {
       setNotice('');
-      const raw = adminEmail.trim();
-      if (!raw.includes('@') && raw.replace(/\D/g, '').length < 8) throw new Error('اكتب رقم موبايل أو إيميل صحيح');
-      const em = loginId(raw);
-      const phone = raw.includes('@') ? undefined : showId(em);
+      const em = adminEmail.trim().toLowerCase();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) throw new Error('اكتب إيميل صحيح');
       const r = await tempClient().auth.signUp({
         email: em,
         password: adminPass,
-        options: { data: { app: APP_TAG, full_name: adminName.trim() || 'مدير', phone, role: 'client' } },
+        options: { data: { app: APP_TAG, full_name: adminName.trim() || 'مدير', role: 'client' } },
       });
       const existed = !!r.error && /already|registered|exists/i.test(r.error.message);
       if (r.error && !existed) throw r.error;
@@ -89,7 +87,7 @@ export default function AdminUsersPage() {
       <Card className="mb-5">
         <div className="mb-2 font-bold">➕ إضافة مدير معاك</div>
         <p className="mb-3 text-sm text-gray-600">
-          اكتب اسمه ورقم موبايله (أو إيميله) وباسورد، هيبقى مدير زيك ويدخل بيهم على طول من صفحة الدخول.
+          اكتب اسمه وإيميله وباسورد، هيبقى مدير زيك ويدخل بيهم على طول من صفحة الدخول.
         </p>
         <form
           className="grid gap-3 sm:grid-cols-2"
@@ -99,7 +97,7 @@ export default function AdminUsersPage() {
           }}
         >
           <Input placeholder="الاسم" value={adminName} onChange={(e) => setAdminName(e.target.value)} />
-          <Input dir="ltr" required placeholder="رقم الموبايل أو الإيميل" value={adminEmail} onChange={(e) => setAdminEmail(e.target.value)} />
+          <Input dir="ltr" type="email" required placeholder="الإيميل" value={adminEmail} onChange={(e) => setAdminEmail(e.target.value)} />
           <Input dir="ltr" type="text" required minLength={6} placeholder="باسورد (6 حروف أو أكتر)" value={adminPass} onChange={(e) => setAdminPass(e.target.value)} />
           <Button type="submit" disabled={action.busy}>➕ إضافة مدير</Button>
         </form>
